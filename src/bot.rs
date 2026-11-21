@@ -409,7 +409,7 @@ fn xf_revert_s() -> f32 {
 /// until a practice submission repeats the pick's score exactly).
 fn foreign_damage_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *K.get_or_init(|| std::env::var("MB_FD").is_ok())
+    *K.get_or_init(|| std::env::var("MB_NOFD").is_err())
 }
 
 fn scav_on() -> bool {
