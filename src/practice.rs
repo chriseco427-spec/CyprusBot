@@ -12,12 +12,17 @@ use std::sync::OnceLock;
 /// 12: follow up a hunter we wounded below this HP fraction (0 = off)   13: only while our HP
 ///     fraction is above this
 /// 14: offense-first upgrades in practice (1) / shared order (0)
+/// 15-18: reserved (range, close and focus branches)
+/// 19: gun+lightning build (1): rush lightning instead of a laser, never trade lightning for a
+///     laser, swap a held laser for lightning when safe, keep the gun. The two practice leaders
+///     (5.96, 5.75) play gun+lightning 67-72% of the time and fire almost no laser.
+/// 20: lightning reach (m) in that build   21: with lightning, hold our distance (1) / walk in to 30 m (0)
 pub(super) fn knob(i: usize) -> f32 {
-    static K: OnceLock<[f32; 15]> = OnceLock::new();
+    static K: OnceLock<[f32; 22]> = OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.65, 0.5, 1.0];
+        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.65, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 250.0, 1.0];
         if let Ok(e) = std::env::var("PR_TUNE") {
-            for (j, x) in e.split(',').enumerate().take(15) {
+            for (j, x) in e.split(',').enumerate().take(22) {
                 k[j] = x.parse().unwrap_or(k[j]);
             }
         }
@@ -33,8 +38,12 @@ impl Bot {
         if knob(0) < 0.5 {
             return None;
         }
-        let slot_free = me.wpn[0].is_none() || me.wpn[1].is_none() || (knob(4) > 0.5 && has_light);
-        if !slot_free || has_laser {
+        let lm = lightning_mode();
+        if lm && has_light {
+            return None;
+        }
+        let slot_free = me.wpn[0].is_none() || me.wpn[1].is_none() || (!lm && knob(4) > 0.5 && has_light) || (lm && has_laser);
+        if !slot_free || (!lm && has_laser) {
             return None;
         }
         let mut best: Option<(f32, (f32, f32), i64)> = None;
@@ -43,7 +52,8 @@ impl Bot {
                 continue;
             }
             let (reach, pref) = match it.kind.as_str() {
-                "laser" => (knob(1), 0.6),
+                "laser" if !lm => (knob(1), 0.6),
+                "lightning" if lm => (knob(20), 0.6),
                 "lightning" if !has_light => (knob(2), 1.0),
                 _ => continue,
             };
@@ -70,7 +80,12 @@ impl Bot {
     /// Practice only: drop lightning for a laser when no enemy is close enough to punish the
     /// 1.65 s the new laser needs before it can fire.
     pub(super) fn practice_swap_ok(&self, me: &Me, threats: &[Enemy]) -> bool {
-        self.mode == 1 && knob(4) > 0.5 && !threats.iter().any(|e| dxy(&e.pos, &me.pos) < knob(5))
+        self.mode == 1 && !lightning_mode() && knob(4) > 0.5 && !threats.iter().any(|e| dxy(&e.pos, &me.pos) < knob(5))
+    }
+
+    /// Practice, lightning build: drop a laser for lightning when no enemy is close.
+    pub(super) fn practice_swap_to_light_ok(&self, me: &Me, threats: &[Enemy]) -> bool {
+        self.mode == 1 && lightning_mode() && !threats.iter().any(|e| dxy(&e.pos, &me.pos) < knob(5))
     }
 
     /// Practice: where to go to finish a hunter we wounded that broke off. House experts break off
@@ -106,4 +121,9 @@ pub(super) fn upgrade_score(id: &str) -> Option<i32> {
         "nanites" => 80,
         _ => return None,
     })
+}
+
+/// Practice plays the gun+lightning build (knob 19).
+pub(super) fn lightning_mode() -> bool {
+    knob(19) > 0.5
 }

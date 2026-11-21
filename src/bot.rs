@@ -1362,7 +1362,10 @@ impl Bot {
                 if empty.is_some() {
                     take = p["id"].as_i64();
                 } else if let Some(w1) = &me.wpn[1] {
-                    let upgrade = (w1.kind == "mortar") || (self.tune[12] < 0.5 && w1.kind == "lightning" && kind == "laser" && (threats.is_empty() || self.practice_swap_ok(&me, &threats)));
+                    let lm = self.mode == 1 && practice::lightning_mode();
+                    let upgrade = (w1.kind == "mortar")
+                        || (self.tune[12] < 0.5 && !lm && w1.kind == "lightning" && kind == "laser" && (threats.is_empty() || self.practice_swap_ok(&me, &threats)))
+                        || (w1.kind == "laser" && kind == "lightning" && self.practice_swap_to_light_ok(&me, &threats));
                     if upgrade && w1.charge <= 0.0 {
                         take = p["id"].as_i64();
                         drop = Some(1);
@@ -1396,6 +1399,9 @@ impl Bot {
         if me.wpn[1].is_none() || (self.tune[12] > 0.5 && gun_s.is_some()) {
             for (id, it) in &self.pickups {
                 if self.blacklist.get(id).map_or(false, |u| t < *u) || !(it.kind == "laser" || it.kind == "lightning") || slot_of(&it.kind).is_some() {
+                    continue;
+                }
+                if self.mode == 1 && practice::lightning_mode() && it.kind == "laser" {
                     continue;
                 }
                 let d = dxy(&it.pos, &me.pos);
@@ -1673,7 +1679,8 @@ impl Bot {
             let dir = [to[0] / d, to[1] / d];
             let mut range = self.tune[0];
             if light_s.is_some() && me.energy > 25.0 {
-                range = 30.0;
+                // Practice lightning build: hold our distance and let the hunters walk into the arc.
+                range = if self.mode == 1 && practice::lightning_mode() && practice::knob(21) > 0.5 { d.max(30.0) } else { 30.0 };
             } else if e.has("lightning") {
                 range = 65.0;
             }
@@ -1740,8 +1747,12 @@ impl Bot {
             let want_laser = laser_s.is_none();
             let slot_free = me.wpn[1].is_none() || me.wpn[0].is_none();
             for (id, it) in &self.pickups {
-                let wanted = ((slot_free || (self.tune[12] > 0.5 && gun_s.is_some())) && (it.kind == "laser" || it.kind == "lightning") && slot_of(&it.kind).is_none())
-                    || (!slot_free && want_laser && it.kind == "laser" && light_s.is_some());
+                let wanted = if self.mode == 1 && practice::lightning_mode() {
+                    it.kind == "lightning" && light_s.is_none()
+                } else {
+                    ((slot_free || (self.tune[12] > 0.5 && gun_s.is_some())) && (it.kind == "laser" || it.kind == "lightning") && slot_of(&it.kind).is_none())
+                        || (!slot_free && want_laser && it.kind == "laser" && light_s.is_some())
+                };
                 // Opening (match type not known yet, or practice still guarded): no walk to a weapon
                 // across open streets. 10 AM: hit at 6 s on a walk to a weapon 71 m away in the open.
                 let opening = opening_safe_on() && (self.mode == 0 || p_lite);
