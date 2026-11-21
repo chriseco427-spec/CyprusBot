@@ -96,10 +96,10 @@ pub(super) fn upgrade_score(id: &str) -> Option<i32> {
         return None;
     }
     Some(match id {
+        "plating" => 110,
+        "armor" => 107,
         "laser_damage" => 105,
-        "plating" => 100,
         "laser_charge" => 97,
-        "armor" => 95,
         "gun_damage" => 90,
         "gun_rate" => 88,
         "lightning_efficiency" => 85,
