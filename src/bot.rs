@@ -953,6 +953,8 @@ impl Bot {
             }
         }
         let cautious = self.mode != 1;
+        // Trade the gun for a second special: tune[12] everywhere, or practice::knob(14) in practice.
+        let dual = self.tune[12] > 0.5 || (self.mode == 1 && practice::knob(14) > 0.5);
         // "Practice" by default is only a guess until someone dies: in recorded free-for-alls the
         // first death comes at a median of 11 s and after 16 s in one match in eight. Until then,
         // or until our own first kill, defend ourselves but do not rush weapons, boost around or
@@ -1120,11 +1122,11 @@ impl Bot {
                 if empty.is_some() {
                     take = p["id"].as_i64();
                 } else if let Some(w1) = &me.wpn[1] {
-                    let upgrade = (w1.kind == "mortar") || (self.tune[12] < 0.5 && w1.kind == "lightning" && kind == "laser" && (threats.is_empty() || self.practice_swap_ok(&me, &threats)));
+                    let upgrade = (w1.kind == "mortar") || (!dual && w1.kind == "lightning" && kind == "laser" && (threats.is_empty() || self.practice_swap_ok(&me, &threats)));
                     if upgrade && w1.charge <= 0.0 {
                         take = p["id"].as_i64();
                         drop = Some(1);
-                    } else if self.tune[12] > 0.5 {
+                    } else if dual {
                         if let Some(gs) = gun_s {
                             take = p["id"].as_i64();
                             drop = Some(gs as i64);
@@ -1151,7 +1153,7 @@ impl Bot {
 
         // Nearest weapon worth having while slot 1 is empty.
         let mut near_gun: Option<(f32, (f32, f32), i64)> = None;
-        if me.wpn[1].is_none() || (self.tune[12] > 0.5 && gun_s.is_some()) {
+        if me.wpn[1].is_none() || (dual && gun_s.is_some()) {
             for (id, it) in &self.pickups {
                 if self.blacklist.get(id).map_or(false, |u| t < *u) || !(it.kind == "laser" || it.kind == "lightning") || slot_of(&it.kind).is_some() {
                     continue;
@@ -1466,7 +1468,7 @@ impl Bot {
             let want_laser = laser_s.is_none();
             let slot_free = me.wpn[1].is_none() || me.wpn[0].is_none();
             for (id, it) in &self.pickups {
-                let wanted = ((slot_free || (self.tune[12] > 0.5 && gun_s.is_some())) && (it.kind == "laser" || it.kind == "lightning") && slot_of(&it.kind).is_none())
+                let wanted = ((slot_free || (dual && gun_s.is_some())) && (it.kind == "laser" || it.kind == "lightning") && slot_of(&it.kind).is_none())
                     || (!slot_free && want_laser && it.kind == "laser" && light_s.is_some());
                 if wanted && !danger(&it.pos) && (!cautious || it.pos[2] - me.pos[2] <= 3.0) && in_bounds(&it.pos) && (it.pos[2] - self.w.surf_at(it.pos[0], it.pos[1])).abs() < 2.0 {
                     let pref = if it.kind == "laser" { 0.6 } else { 0.8 };
