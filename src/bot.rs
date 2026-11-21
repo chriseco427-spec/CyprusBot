@@ -1311,7 +1311,6 @@ impl Bot {
                 // the first hit wins three duels in four, and most of the top teams collapse when
                 // hit first. We need to be fresh, and to hold a ready laser or be close enough
                 // for the gun to count.
-                let away = wrap(aim_to(e.eye(), my_center)[0] - e.aim[0]).abs() > 1.3;
                 let busy = e.hp < 0.85 * e.max_hp
                     || threats.iter().any(|o| o.id != e.id && dxy(&o.pos, &e.pos) < 220.0 && wrap(aim_to(e.eye(), o.center())[0] - e.aim[0]).abs() < 0.25);
                 let laser_ready = laser_s.and_then(|sl| me.wpn[sl].as_ref()).map_or(false, |w| w.cooldown <= 0.2);
