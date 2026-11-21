@@ -12,12 +12,16 @@ use std::sync::OnceLock;
 /// 12: follow up a hunter we wounded below this HP fraction (0 = off)   13: only while our HP
 ///     fraction is above this
 /// 14: offense-first upgrades in practice (1) / shared order (0)
+/// 15: reserved (practice fight range on the range branches)
+/// 16: practice fight range (m) against hunters without lightning (0 = shared 55 m). Closer means
+///     more gun hits alongside the laser and faster kills; fighting from range scored worse in
+///     real practice (5.31 over three draws against 5.58).
 pub(super) fn knob(i: usize) -> f32 {
-    static K: OnceLock<[f32; 15]> = OnceLock::new();
+    static K: OnceLock<[f32; 17]> = OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.65, 0.5, 1.0];
+        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.65, 0.5, 1.0, 0.0, 40.0];
         if let Ok(e) = std::env::var("PR_TUNE") {
-            for (j, x) in e.split(',').enumerate().take(15) {
+            for (j, x) in e.split(',').enumerate().take(17) {
                 k[j] = x.parse().unwrap_or(k[j]);
             }
         }
