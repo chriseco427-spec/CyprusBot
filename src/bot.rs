@@ -970,7 +970,7 @@ impl Bot {
                 match self.policy {
                     1 => e.hostile_until > t,
                     2 => e.hostile_until > t || (!any_hostile && hp_frac > 0.9),
-                    _ => true,
+                    _ => !(self.mode == 1 && practice::knob(14) > 0.5) || e.hostile_until > t || hp_frac >= practice::knob(15),
                 }
             };
             if allowed && d < 260.0 && self.w.los(muzzle, e.center()) {
@@ -1363,6 +1363,10 @@ impl Bot {
                 range = 30.0;
             } else if e.has("lightning") {
                 range = 65.0;
+            }
+            if self.mode == 1 && practice::knob(14) > 0.5 && !(light_s.is_some() && me.energy > 25.0) {
+                // Practice kite: hold 100-140 m and keep easing away from the target.
+                range = (d + 8.0).clamp(100.0, 140.0);
             }
             let out = self.strafe_vec(here, me.pos[2], dir, d, range, t, &z);
             let burst = me.energy > 55.0 && (t * 1.3).sin() > 0.3;
