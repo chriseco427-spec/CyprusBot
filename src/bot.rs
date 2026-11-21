@@ -312,6 +312,55 @@ fn crossfire2() -> (usize, f32) {
 const XF2_SECTORS: usize = 0;
 const XF2_SECONDS: f32 = 12.0;
 
+/// Free-for-all: keep 60 m from supply drops we are not taking (`MB_NODROPAWAY=1` turns it off).
+fn drop_away_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NODROPAWAY").is_err())
+}
+
+/// Free-for-all: laser the mortar carrier first (`MB_NOMORTARFIRST=1` turns it off).
+fn mortar_first_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOMORTARFIRST").is_err())
+}
+
+/// Free-for-all: near a laser holder, move only along cover (`MB_NOCOVERRULE=1` turns it off).
+fn cover_rule_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOCOVERRULE").is_err())
+}
+
+/// Longest stretch (m) of the straight route a -> b with no building within 8 m.
+fn open_run_on(w: &World, a: (f32, f32), b: (f32, f32)) -> f32 {
+    let len = (b.0 - a.0).hypot(b.1 - a.1);
+    let n = (len / 4.0).ceil().max(1.0) as i32;
+    let (mut run, mut best) = (0.0f32, 0.0f32);
+    for k in 0..=n {
+        let f = k as f32 / n as f32;
+        let (x, y) = (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
+        let mut near = false;
+        'probe: for r in [0.0f32, 4.0, 8.0] {
+            for q in 0..8 {
+                let ang = q as f32 * std::f32::consts::FRAC_PI_4;
+                if w.prism[w.cell(x + r * ang.cos(), y + r * ang.sin())] {
+                    near = true;
+                    break 'probe;
+                }
+                if r == 0.0 {
+                    break;
+                }
+            }
+        }
+        if near {
+            run = 0.0;
+        } else {
+            run += len / n as f32;
+            best = best.max(run);
+        }
+    }
+    best
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -353,6 +402,13 @@ pub struct Bot {
     escape_until: f32,
     /// Replay marker (look straight up for 0.4 s once, on confirmed free-for-all): when it ran.
     marker_t: f32,
+    /// Free-for-all: landed or held supply drops we are not taking (keep 60 m away), and the drop
+    /// we are walking to, if any.
+    drop_avoid: Vec<[f32; 2]>,
+    drop_goal: i64,
+    /// Free-for-all: longest stretch of open ground (m) a goal's route may cross; infinite unless
+    /// a laser holder is within 140 m (LASER.md rule 2).
+    cover_lim: f32,
     /// When our laser charge reached full (the reported charge stops at full, so how long it has
     /// been held must be timed here), or -1.
     full_since: f32,
@@ -485,6 +541,9 @@ impl Bot {
             climb_until: -1.0,
             escape_until: -1.0,
             marker_t: -1.0,
+            drop_avoid: Vec::new(),
+            drop_goal: -1,
+            cover_lim: f32::INFINITY,
             full_since: -1.0,
             climb_goal: (0.0, 0.0),
             blacklist: HashMap::new(),
@@ -737,6 +796,12 @@ impl Bot {
                 if self.npc_mem.values().any(|n| (n.0[0] - x).hypot(n.0[1] - y) < 58.0) {
                     continue;
                 }
+                if self.drop_avoid.iter().any(|q| (q[0] - x).hypot(q[1] - y) < 60.0) {
+                    continue;
+                }
+                if self.cover_lim.is_finite() && self.open_run((me.pos[0], me.pos[1]), (x, y)) > self.cover_lim {
+                    continue;
+                }
                 if self.avoid.iter().any(|a| t < a.1 && (a.0 .0 - x).hypot(a.0 .1 - y) < 14.0) {
                     continue;
                 }
@@ -768,6 +833,12 @@ impl Bot {
                     continue;
                 }
                 if self.npc_mem.values().any(|n| (n.0[0] - x).hypot(n.0[1] - y) < 58.0) {
+                    continue;
+                }
+                if self.drop_avoid.iter().any(|q| (q[0] - x).hypot(q[1] - y) < 60.0) {
+                    continue;
+                }
+                if self.cover_lim.is_finite() && self.open_run((me.pos[0], me.pos[1]), (x, y)) > self.cover_lim {
                     continue;
                 }
                 if self.avoid.iter().any(|a| t < a.1 && (a.0 .0 - x).hypot(a.0 .1 - y) < 14.0) {
@@ -865,34 +936,7 @@ impl Bot {
 
     /// Longest stretch (m) of the straight line a-b with no building within about 8 m.
     fn open_run(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
-        let w = &self.w;
-        let len = (b.0 - a.0).hypot(b.1 - a.1);
-        let n = (len / 4.0).ceil().max(1.0) as i32;
-        let (mut run, mut best) = (0.0f32, 0.0f32);
-        for k in 0..=n {
-            let f = k as f32 / n as f32;
-            let (x, y) = (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
-            let mut near = false;
-            'probe: for r in [0.0f32, 4.0, 8.0] {
-                for q in 0..8 {
-                    let ang = q as f32 * std::f32::consts::FRAC_PI_4;
-                    if w.prism[w.cell(x + r * ang.cos(), y + r * ang.sin())] {
-                        near = true;
-                        break 'probe;
-                    }
-                    if r == 0.0 {
-                        break;
-                    }
-                }
-            }
-            if near {
-                run = 0.0;
-            } else {
-                run += len / n as f32;
-                best = best.max(run);
-            }
-        }
-        best
+        open_run_on(&self.w, a, b)
     }
 
     /// Sideways movement around a point at about `range`, reversing unpredictably and never
@@ -1189,6 +1233,31 @@ impl Bot {
                 self.mode = 1;
             }
         }
+        // Free-for-all: a supply drop that has landed or that someone is capturing is a kill zone
+        // for everyone near it who is not in the ring (ENDGAME.md: 10 of 16 mechs lingering 8-40 m
+        // from one died within 20 s, against 4 of 35 inside the ring). Commit or keep 60 m away.
+        self.drop_avoid.clear();
+        if self.mode == 2 && drop_away_on() {
+            if let Some(ds) = obs["drops"].as_array() {
+                for d in ds {
+                    let id = d["id"].as_i64().unwrap_or(-1);
+                    let live = f(&d["lands_in"]) <= 3.0 || !d["holder"].is_null();
+                    if live && id != self.drop_goal {
+                        let p = v3(&d["pos"]);
+                        self.drop_avoid.push([p[0], p[1]]);
+                    }
+                }
+            }
+        }
+        // Free-for-all, LASER.md rule 2: within 140 m of a known laser holder, keep cover in reach
+        // (within about 7 m walking, 12 m with energy to boost). Half the gun-side deaths had cover
+        // a median 6 m away and never reached it. Goals whose route crosses more open ground than
+        // this are skipped while the holder is near.
+        self.cover_lim = if self.mode == 2 && cover_rule_on() && self.enemies.values().any(|e| t - e.seen < 10.0 && e.has("laser") && dxy(&e.pos, &me.pos) < 140.0) {
+            if me.energy >= 30.0 { 16.0 } else { 8.0 }
+        } else {
+            f32::INFINITY
+        };
         let cautious = self.mode != 1;
         // "Practice" by default is only a guess until someone dies: in recorded free-for-alls the
         // first death comes at a median of 11 s and after 16 s in one match in eight. Until then,
@@ -1256,7 +1325,11 @@ impl Bot {
                 }
             };
             if allowed && d < 260.0 && self.w.los(muzzle, e.center()) {
-                let score = d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 };
+                let mut score = d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 };
+                // Free-for-all: our laser does 60% more to a mortar carrier.
+                if self.mode == 2 && mortar_first_on() && laser_s.is_some() && e.has("mortar") {
+                    score -= 40.0;
+                }
                 if score < best {
                     best = score;
                     target = Some(e.clone());
@@ -1481,6 +1554,12 @@ impl Bot {
                     continue;
                 }
                 if ffa_walk && self.npc_mem.values().any(|n| (n.0[0] - it.pos[0]).hypot(n.0[1] - it.pos[1]) < 50.0) {
+                    continue;
+                }
+                if self.drop_avoid.iter().any(|q| (q[0] - it.pos[0]).hypot(q[1] - it.pos[1]) < 60.0) {
+                    continue;
+                }
+                if self.cover_lim.is_finite() && self.open_run(here, (it.pos[0], it.pos[1])) > self.cover_lim {
                     continue;
                 }
                 // Someone else closer to it, or a shooter between us and a long run: leave it.
@@ -1744,7 +1823,9 @@ impl Bot {
             let mut goal: Option<(f32, (f32, f32), i64)> = None;
             let bl = &self.blacklist;
             let en = &self.enemies;
-            let danger = |p: &[f32; 3]| cautious && en.values().any(|e| t - e.seen < 12.0 && dxy(&e.pos, p) < 90.0);
+            let da = &self.drop_avoid;
+            let (wref, lim) = (&*self.w, self.cover_lim);
+            let danger = |p: &[f32; 3]| cautious && (en.values().any(|e| t - e.seen < 12.0 && dxy(&e.pos, p) < 90.0) || da.iter().any(|q| (q[0] - p[0]).hypot(q[1] - p[1]) < 60.0));
             let calm = !cautious || en.values().all(|e| t - e.seen > 8.0);
             // Free-for-all, badly hurt: regenerate where we are rather than walk out for loot (9 AM:
             // killed at 21% HP in the open right after a kill).
@@ -1754,6 +1835,9 @@ impl Bot {
                     return;
                 }
                 if lie_low && dxy(p, &me.pos) > 20.0 {
+                    return;
+                }
+                if lim.is_finite() && open_run_on(wref, here, (p[0], p[1])) > lim {
                     return;
                 }
                 if goal.map_or(true, |g| score < g.0) {
@@ -1909,7 +1993,7 @@ impl Bot {
                                 let a = self.rand() * TAU;
                                 let r = z.nr * 0.8 * self.rand().sqrt();
                                 let p = (z.nc[0] + r * a.cos(), z.nc[1] + r * a.sin());
-                                if self.w.free_at(p.0, p.1) && !self.w.prism[self.w.cell(p.0, p.1)] {
+                                if self.w.free_at(p.0, p.1) && !self.w.prism[self.w.cell(p.0, p.1)] && !self.drop_avoid.iter().any(|q| (q[0] - p.0).hypot(q[1] - p.1) < 60.0) && (self.cover_lim.is_infinite() || self.open_run(here, p) <= self.cover_lim) {
                                     pick = Some(p);
                                     break;
                                 }
@@ -1926,6 +2010,10 @@ impl Bot {
             }
         }
 
+        self.drop_goal = match goal_id {
+            Some(g) if (20000..30000).contains(&g) => g,
+            _ => -1,
+        };
         let weave_ok = matches!(mv, Mv::Goto(..));
         let flee_hold_now = flee_hold && matches!(mv, Mv::Hold);
         let mut jump = false;
