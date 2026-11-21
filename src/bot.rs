@@ -187,7 +187,7 @@ fn fx(i: usize) -> f32 {
 /// How long a match that looks like practice is still treated as possibly a free-for-all.
 pub(crate) fn p_lite_until() -> f32 {
     static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *K.get_or_init(|| std::env::var("MB_PLITE").ok().and_then(|v| v.parse().ok()).unwrap_or(16.0))
+    *K.get_or_init(|| std::env::var("MB_PLITE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
 }
 
 fn first_shot_on() -> bool {
