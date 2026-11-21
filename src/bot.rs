@@ -291,6 +291,17 @@ pub(crate) fn opening_safe_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOOPENSAFE").is_err())
 }
 
+/// `MB_XF2=sectors,seconds` (0 sectors = off).
+fn crossfire2() -> (usize, f32) {
+    static K: std::sync::OnceLock<(usize, f32)> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let v: Vec<f32> = std::env::var("MB_XF2").ok().map(|e| e.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+        if v.len() == 2 { (v[0] as usize, v[1]) } else { (XF2_SECTORS, XF2_SECONDS) }
+    })
+}
+const XF2_SECTORS: usize = 4;
+const XF2_SECONDS: f32 = 12.0;
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -1139,7 +1150,20 @@ impl Bot {
                 let centres: Vec<f32> = h.iter().filter(|a| h.iter().filter(|b| wrap(a.0 - b.0).abs() < 0.35).count() >= 3).map(|a| a.0).collect();
                 centres.iter().any(|a| centres.iter().any(|b| wrap(a - b).abs() >= 1.05))
             };
-            if foreign_death || crossfire || (self.mode == 0 && (wounded_by_others || ganged)) {
+            // Stricter form of the same idea, by volume: weapon fire from N or more of eight
+            // compass sectors, three shots each, within the first seconds. Real free-for-alls are
+            // loud at once (median: four sectors inside 8 s); the plain two-direction rule fired in
+            // about half of practice matches (3.98 against 5.75).
+            let (xn, xt) = crossfire2();
+            let crossfire2 = xn > 0 && self.mode != 2 && self.kills == 0 && t <= xt && {
+                let mut bins = [0u8; 8];
+                for h in &self.fire_heard {
+                    let k = (((h.0 + std::f32::consts::PI) / (std::f32::consts::PI / 4.0)) as usize).min(7);
+                    bins[k] = bins[k].saturating_add(1);
+                }
+                bins.iter().filter(|&&c| c >= 3).count() >= xn
+            };
+            if foreign_death || crossfire || crossfire2 || (self.mode == 0 && (wounded_by_others || ganged)) {
                 self.mode = 2;
             } else if self.mode == 0 && t >= self.tune[9] {
                 self.mode = 1;
