@@ -324,6 +324,8 @@ pub struct Bot {
     climb_until: f32,
     /// Jetting out of a spot we cannot walk out of (free-for-all), and until when.
     escape_until: f32,
+    /// Replay marker (look straight up for 0.4 s once, on confirmed free-for-all): when it ran.
+    marker_t: f32,
     climb_goal: (f32, f32),
     blacklist: HashMap<i64, f32>,
     policy: u8,
@@ -452,6 +454,7 @@ impl Bot {
             last_aim: [0.0, 0.0],
             climb_until: -1.0,
             escape_until: -1.0,
+            marker_t: -1.0,
             climb_goal: (0.0, 0.0),
             blacklist: HashMap::new(),
             policy: cfg.policy,
@@ -2162,6 +2165,17 @@ impl Bot {
             if fx(0) > 0.5 && w.charge > 0.0 && !fire[s] && !laser_release && w.charge < w.full_charge + fx(1) {
                 fire[s] = true;
             }
+        }
+        // Replay marker: the first time we are sure of a free-for-all and nothing is in view, look
+        // straight up for 0.4 s without firing. It shows in the public replays which of our builds
+        // a showdown is running (marker v1 = rel-ffa9 onward).
+        let charging_now = laser_s.and_then(|s| me.wpn[s].as_ref()).map_or(false, |w| w.charge > 0.0);
+        if self.mode == 2 && threats.is_empty() && !charging_now && t - self.last_hurt_t > 3.0 && (self.marker_t < 0.0 || t - self.marker_t < 0.4) {
+            if self.marker_t < 0.0 {
+                self.marker_t = t;
+            }
+            aim = [me.aim[0], 1.2];
+            fire = [false, false];
         }
         // Lightning: instant arc at anything hostile inside the cone.
         if let Some(s) = light_s {
