@@ -260,6 +260,11 @@ fn hide_knob(i: usize) -> f32 {
     })[i]
 }
 
+fn fetch_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOFETCH").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -585,6 +590,11 @@ impl Bot {
                 if self.avoid.iter().any(|a| (a.0 .0 - x).hypot(a.0 .1 - y) < 8.0) {
                     continue;
                 }
+                // Free-for-all: cover inside a known drone's reach is no cover (5 AM: we hid 24 m
+                // from a drone and it killed us).
+                if self.mode == 2 && self.npc_mem.values().any(|n| (n.0[0] - x).hypot(n.0[1] - y) < 50.0) {
+                    continue;
+                }
                 let mut cost = d;
                 let mut near = f32::INFINITY;
                 for e in &threats {
@@ -650,7 +660,10 @@ impl Bot {
                 if raw == u16::MAX || d > rmax {
                     continue;
                 }
-                let score = raw as f32 / 100.0 + hide_knob(0) * d;
+                // The inner part of the next circle draws the most traffic mid-match (hit risk 27 to
+                // 29% against 16 to 18% at 0.5 to 1.25 of its radius), on top of what the table saw.
+                let inner = z.nr > 60.0 && (x - z.nc[0]).hypot(y - z.nc[1]) < 0.45 * z.nr;
+                let score = raw as f32 / 100.0 + hide_knob(0) * d + if inner { 40.0 } else { 0.0 };
                 if best.map_or(false, |b| score >= b.0) {
                     continue;
                 }
@@ -1208,6 +1221,16 @@ impl Bot {
             // ground costs a full hit every 2.4 s (we lost 1,400 HP in 12 s that way), but a laser
             // carrier that lightning keeps hitting cannot charge at all. Shot at by a lone laser
             // carrier while we hold lightning: run in, and stay inside 45 m until it is dead.
+            // Attacked up close (scouting: inside 60 m the attacked side dies 26% of the time and
+            // pushing in wins 40%; running only shows our back). Test switch MB_CLOSEIN=1.
+            if self.mode == 2 && std::env::var("MB_CLOSEIN").is_ok() && hostiles.len() == 1 && arc_target.is_none() {
+                let h = hostiles[0];
+                let d = dxy(&h.pos, &me.pos);
+                let others = threats.iter().filter(|o| o.id != h.id && dxy(&o.pos, &me.pos) < 130.0).count();
+                if d < 60.0 && t - h.hurt_me_t < 3.0 && others == 0 && hp_frac > 0.4 && power(h) < 1.3 * my_power && self.w.los(muzzle, h.center()) {
+                    arc_target = Some(h.clone());
+                }
+            }
             if self.mode == 2 && arc_rush_on() && light_s.is_some() && hostiles.len() == 1 {
                 let h = hostiles[0];
                 let d = dxy(&h.pos, &me.pos);
@@ -1353,14 +1376,21 @@ impl Bot {
         // practice has a rush of its own: flip PRACTICE_HAS_OWN_RUSH when that lands.
         const PRACTICE_HAS_OWN_RUSH: bool = true;
         let mut ffa_rush: Option<(f32, (f32, f32), i64)> = None;
-        if self.tune[13] < 0.5 && fx(15) < 0.5 && me.wpn[1].is_none() && (self.mode != 1 || !PRACTICE_HAS_OWN_RUSH) {
+        // Confirmed free-for-all, gun only, after 20 s: walk (never boost) to an uncontested
+        // special within 90 m. With the rush off we went gun-only all match in 3 of 6 matches at
+        // 5 AM, and holding a laser for most of a match goes with 9.8 points against 5.2 gun-only.
+        let ffa_walk = self.mode == 2 && fetch_on() && fx(15) >= 0.5 && t >= 20.0 && me.wpn[1].is_none() && hp_frac > 0.5;
+        if ffa_walk || (self.tune[13] < 0.5 && fx(15) < 0.5 && me.wpn[1].is_none() && (self.mode != 1 || !PRACTICE_HAS_OWN_RUSH)) {
             for (id, it) in &self.pickups {
                 if self.blacklist.get(id).map_or(false, |u| t < *u) || !(it.kind == "laser" || it.kind == "lightning") {
                     continue;
                 }
                 let d = dxy(&it.pos, &me.pos);
                 let climb = (it.pos[2] - me.pos[2]).max(0.0);
-                if d > 130.0 || climb > 3.0 || !in_bounds(&it.pos) {
+                if d > (if ffa_walk { 90.0 } else { 130.0 }) || climb > 3.0 || !in_bounds(&it.pos) {
+                    continue;
+                }
+                if ffa_walk && self.npc_mem.values().any(|n| (n.0[0] - it.pos[0]).hypot(n.0[1] - it.pos[1]) < 50.0) {
                     continue;
                 }
                 // Someone else closer to it, or a shooter between us and a long run: leave it.
@@ -1394,7 +1424,9 @@ impl Bot {
         // A drone is hitting us and no mech can see us: deal with it now, even from a hiding spot
         // (sitting in one drone's fire while hiding from a mech cost 438 HP in a recorded match).
         let drone_hot = self.tune[15] < 1.5 && t - self.npc_hurt_t < 2.5 && !npcs.is_empty() && target.is_none() && !enemy_los;
-        let drone_flee = drone_hot && drones_near >= 2;
+        // Low on HP next to one drone (free-for-all): no branch below covered it, so we held still
+        // and let a lone drone finish us at 5 AM. Walk out of its reach instead.
+        let drone_flee = drone_hot && (drones_near >= 2 || (self.mode == 2 && hp_frac <= 0.2));
         let farm_drone = self.tune[15] < 0.5 && drones_near <= 1 && target.is_none() && hp_frac > 0.75 && quiet && t >= 25.0;
         if !drone_flee && ((drone_hot && drones_near == 1 && hp_frac > 0.2) || farm_drone) {
             let mut bd = 85.0;
@@ -1546,7 +1578,7 @@ impl Bot {
             goal_id = Some(r.2);
             // On foot in the opening unless it is right here: boosting from second 1 left us at
             // 11 to 41 energy and hit in the open at 1 AM.
-            mv = Mv::Goto(r.1, me.energy > 15.0 && (t >= fx(5) || (r.1 .0 - here.0).hypot(r.1 .1 - here.1) < 25.0));
+            mv = Mv::Goto(r.1, !ffa_walk && me.energy > 15.0 && (t >= fx(5) || (r.1 .0 - here.0).hypot(r.1 .1 - here.1) < 25.0));
         } else if drone_flee && target.is_none() {
             // Step out of the drones' reach: straight away from their middle.
             let (mut sx, mut sy, mut k) = (0.0, 0.0, 0.0);

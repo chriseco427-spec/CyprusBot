@@ -57,7 +57,10 @@ impl Bot {
             }
         }
         // (c) A lightning holder close in while we hold a laser and no lightning: leave its 45 m.
-        if fx(11) > 0.5 && has_laser && !has_light {
+        // Free-for-all: any time we lack lightning (4 walk-up deaths in 10 matches to lightning
+        // carriers at 28 to 36 m came while we held only the gun).
+        let light_back = std::env::var("MB_NOLIGHTBACK").is_err() && self.mode == 2;
+        if fx(11) > 0.5 && (has_laser || light_back) && !has_light {
             let close = threats
                 .iter()
                 .filter(|e| e.has("lightning") && dxy(&e.pos, &me.pos) < 50.0)
