@@ -223,11 +223,16 @@ fn arc_knob(i: usize) -> f32 {
 }
 
 /// Weapon fire heard from two directions before our first kill marks a free-for-all.
+fn xf_revert_s() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_XFREVERT").ok().and_then(|v| v.parse().ok()).unwrap_or(18.0))
+}
+
 fn crossfire_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Off: in simulated practice it fired on the house squad too and cost about a point, and
     // house bots shoot crates and drones from 3 s on. `MB_XFIRE=1` turns it on for testing.
-    *K.get_or_init(|| std::env::var("MB_XFIRE").is_ok())
+    *K.get_or_init(|| std::env::var("MB_NOXFIRE").is_err())
 }
 
 /// Discovery risk of standing still at ground spots on an 8 m lattice, row by row from the
@@ -384,6 +389,9 @@ pub struct Bot {
     /// Recent (time, position, velocity) per enemy, to judge how predictable its movement is.
     hist: HashMap<i64, Vec<(f32, [f32; 3], [f32; 3])>>,
     foreign_since: f32,
+    /// Free-for-all set by crossfire alone (time), and whether it was undone for practice.
+    xf_t: f32,
+    xf_off: bool,
     i_hit: Vec<i64>,
     attackers_seen: Vec<i64>,
     hide: Option<(f32, f32)>,
@@ -506,6 +514,8 @@ impl Bot {
             npc_hurt_t: -100.0,
             hist: HashMap::new(),
             foreign_since: -1.0,
+            xf_t: -1.0,
+            xf_off: false,
             i_hit: Vec::new(),
             attackers_seen: Vec::new(),
             hide: None,
@@ -1134,13 +1144,27 @@ impl Bot {
             // apart, three shots each, before we have killed anyone, is mechs fighting each other:
             // in recorded free-for-alls that happens within 5 s for five mechs in six, while the
             // first death (the old signal) comes at a median of 14 s and often after 20 s.
-            let crossfire = crossfire_on() && self.mode != 2 && self.kills == 0 && t < 45.0 && {
+            let crossfire = crossfire_on() && !self.xf_off && self.mode != 2 && self.kills == 0 && t < 45.0 && {
                 let h = &self.fire_heard;
                 let centres: Vec<f32> = h.iter().filter(|a| h.iter().filter(|b| wrap(a.0 - b.0).abs() < 0.35).count() >= 3).map(|a| a.0).collect();
                 centres.iter().any(|a| centres.iter().any(|b| wrap(a - b).abs() >= 1.05))
             };
             if foreign_death || crossfire || (self.mode == 0 && (wounded_by_others || ganged)) {
+                if self.mode != 2 && crossfire && !foreign_death && !wounded_by_others && !ganged {
+                    self.xf_t = t;
+                }
+                if foreign_death || wounded_by_others || ganged {
+                    self.xf_t = -1.0;
+                }
                 self.mode = 2;
+            }
+            // Crossfire alone is a guess: house bots shoot crates and drones from several
+            // directions too. If nobody has died except by our hand by the revert time (97% of real
+            // free-for-alls have a foreign death by 20 s), it was practice after all.
+            if self.mode == 2 && self.xf_t >= 0.0 && t >= xf_revert_s() && self.alive0 - alive <= self.kills {
+                self.mode = 1;
+                self.xf_t = -1.0;
+                self.xf_off = true;
             } else if self.mode == 0 && t >= self.tune[9] {
                 self.mode = 1;
             }
