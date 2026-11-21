@@ -299,7 +299,7 @@ fn crossfire2() -> (usize, f32) {
         if v.len() == 2 { (v[0] as usize, v[1]) } else { (XF2_SECTORS, XF2_SECONDS) }
     })
 }
-const XF2_SECTORS: usize = 4;
+const XF2_SECTORS: usize = 5;
 const XF2_SECONDS: f32 = 12.0;
 
 fn scav_on() -> bool {
