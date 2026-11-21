@@ -195,6 +195,11 @@ fn first_shot_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOFIRST").is_err())
 }
 
+fn regen_hold_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOREGENHOLD").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -1042,8 +1047,12 @@ impl Bot {
         let mut evade_from: Vec<Enemy> = threats.clone();
         if cautious {
             // Keep hiding from mechs seen in the last few seconds, and from a shooter we cannot see.
+            // Wounded in a confirmed free-for-all: stay out of sight of where mechs were for
+            // longer, so we finish regenerating before we show ourselves again (leaving cover at
+            // 68% with the eventual winner 80 m away cost us a third place).
+            let remember = if self.mode == 2 && hp_frac < 0.85 && regen_hold_on() { 25.0 } else { 10.0 };
             for e in self.enemies.values() {
-                if e.seen < t - 0.01 && t - e.seen < 10.0 {
+                if e.seen < t - 0.01 && t - e.seen < remember {
                     evade_from.push(e.clone());
                 }
             }
