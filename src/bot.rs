@@ -200,6 +200,66 @@ fn regen_hold_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOREGENHOLD").is_err())
 }
 
+/// Lightning against a laser carrier (confirmed free-for-all): close in instead of running.
+fn arc_rush_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOARC").is_err())
+}
+
+/// Arc-rush knobs (`MB_ARC=a,b,...` in the simulator). 0: longest run-in (m)   1: HP we want left
+/// on arrival   2: their HP as a share of what one tank of lightning plus the gun can deal
+/// 3: energy we want left on arrival
+fn arc_knob(i: usize) -> f32 {
+    static K: std::sync::OnceLock<[f32; 4]> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let mut k = [110.0, 450.0, 0.8, 30.0];
+        if let Ok(e) = std::env::var("MB_ARC") {
+            for (j, x) in e.split(',').enumerate().take(4) {
+                k[j] = x.parse().unwrap_or(k[j]);
+            }
+        }
+        k
+    })[i]
+}
+
+/// Weapon fire heard from two directions before our first kill marks a free-for-all.
+fn crossfire_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Off: in simulated practice it fired on the house squad too and cost about a point, and
+    // house bots shoot crates and drones from 3 s on. `MB_XFIRE=1` turns it on for testing.
+    *K.get_or_init(|| std::env::var("MB_XFIRE").is_ok())
+}
+
+/// Discovery risk of standing still at ground spots on an 8 m lattice, row by row from the
+/// south-west corner: hundredths of mech-seconds per match (first 180 s) during which a mech in
+/// recorded team-bot matches was within 45 m of the spot or had sight of it within 200 m.
+/// 65535 marks a spot nobody can stand on. Built offline from the event's public replays.
+static HIDE_RISK: &[u8] = include_bytes!("hide_risk.bin");
+const HR_NX: usize = 132;
+const HR_NY: usize = 89;
+const HR_X0: f32 = -501.0;
+const HR_Y0: f32 = -322.0;
+
+fn hide_table_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOHIDETAB").is_err())
+}
+
+/// Hide-table knobs (`MB_HIDE=a,b,c` in the simulator). 0: risk points one metre of travel costs
+/// 1: seconds at a spot before looking for a better one   2: search radius (m)
+fn hide_knob(i: usize) -> f32 {
+    static K: std::sync::OnceLock<[f32; 3]> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let mut k = [0.2, 40.0, 150.0];
+        if let Ok(e) = std::env::var("MB_HIDE") {
+            for (j, x) in e.split(',').enumerate().take(3) {
+                k[j] = x.parse().unwrap_or(k[j]);
+            }
+        }
+        k
+    })[i]
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -253,6 +313,9 @@ pub struct Bot {
     /// An ambush we started: see it through unless it goes badly.
     commit_id: i64,
     commit_until: f32,
+    /// The laser carrier we are closing on with lightning, and until when.
+    arc_id: i64,
+    arc_until: f32,
     /// The target we have had a continuous line of fire to, since when, and when last.
     los_id: i64,
     los_since: f32,
@@ -274,6 +337,8 @@ pub struct Bot {
     climb_block_until: f32,
     /// Deaths we heard: estimated place and time. A death leaves cubes and weapons behind.
     scav: Vec<([f32; 2], f32)>,
+    /// Bearing and time of weapon fire heard from mechs that are not on us.
+    fire_heard: Vec<(f32, f32)>,
     scav_goal: Option<([f32; 2], f32)>,
     /// Drones seen this match: last position and when.
     npc_mem: HashMap<i64, ([f32; 3], f32)>,
@@ -375,6 +440,8 @@ impl Bot {
             peek_retry_t: -100.0,
             commit_id: -1,
             commit_until: -1.0,
+            arc_id: -1,
+            arc_until: -1.0,
             los_id: -1,
             los_since: 0.0,
             los_last: -100.0,
@@ -392,6 +459,7 @@ impl Bot {
             climb_try_goal: (0.0, 0.0),
             climb_block_until: -1.0,
             scav: Vec::new(),
+            fire_heard: Vec::new(),
             scav_goal: None,
             npc_mem: HashMap::new(),
             npc_hurt_t: -100.0,
@@ -559,6 +627,55 @@ impl Bot {
     }
 
     /// A low-exposure spot to wait in, between rmin and rmax metres away.
+    /// The hiding place with the least recorded traffic in reach: low risk in the table, a short
+    /// walk, inside this circle and the next, and away from mechs and drones we know about.
+    fn pick_hide_risk(&self, me: &Me, z: &Zone, t: f32, rmax: f32) -> Option<(f32, f32)> {
+        let w = &self.w;
+        if HIDE_RISK.len() < 2 * HR_NX * HR_NY {
+            return None;
+        }
+        let on_roof = w.prism[w.cell(me.pos[0], me.pos[1])];
+        let margin = 20f32.min(0.3 * z.nr);
+        let mut best: Option<(f32, (f32, f32))> = None;
+        for iy in 0..HR_NY {
+            let y = HR_Y0 + 8.0 * iy as f32;
+            if (y - me.pos[1]).abs() > rmax {
+                continue;
+            }
+            for ix in 0..HR_NX {
+                let x = HR_X0 + 8.0 * ix as f32;
+                let k = iy * HR_NX + ix;
+                let raw = u16::from_le_bytes([HIDE_RISK[2 * k], HIDE_RISK[2 * k + 1]]);
+                let d = (x - me.pos[0]).hypot(y - me.pos[1]);
+                if raw == u16::MAX || d > rmax {
+                    continue;
+                }
+                let score = raw as f32 / 100.0 + hide_knob(0) * d;
+                if best.map_or(false, |b| score >= b.0) {
+                    continue;
+                }
+                let c = w.cell(x, y);
+                if !w.free(c) || w.prism[c] || (!on_roof && (w.surf[c] - me.pos[2]).abs() > 8.0) {
+                    continue;
+                }
+                if (x - z.nc[0]).hypot(y - z.nc[1]) > z.nr - margin || (x - z.c[0]).hypot(y - z.c[1]) > z.r - margin {
+                    continue;
+                }
+                if self.enemies.values().any(|e| t - e.seen < 15.0 && (e.pos[0] - x).hypot(e.pos[1] - y) < 80.0) {
+                    continue;
+                }
+                if self.npc_mem.values().any(|n| (n.0[0] - x).hypot(n.0[1] - y) < 58.0) {
+                    continue;
+                }
+                if self.avoid.iter().any(|a| t < a.1 && (a.0 .0 - x).hypot(a.0 .1 - y) < 14.0) {
+                    continue;
+                }
+                best = Some((score, (x, y)));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
     fn pick_hide(&self, me: &Me, z: &Zone, t: f32, rmin: f32, rmax: f32) -> Option<(f32, f32)> {
         let w = &self.w;
         let mut best: Option<(f32, (f32, f32))> = None;
@@ -887,7 +1004,19 @@ impl Bot {
         // A death is heard across most of the map, with a bearing and a rough distance.
         if let Some(ss) = obs["sounds"].as_array() {
             for snd in ss {
-                if snd["kind"].as_str() != Some("death") {
+                let kind = snd["kind"].as_str().unwrap_or("");
+                if matches!(kind, "gun" | "laser" | "mortar" | "lightning") && snd["dist"].as_str() != Some("near") && self.kills == 0 && t < 45.0 {
+                    if let Some(b) = snd["bearing"].as_f64() {
+                        let b = b as f32;
+                        // Leave out any direction where we know of a mech: that may be the one
+                        // hunter, or a mech we picked a fight with.
+                        let known = self.enemies.values().any(|e| wrap(b - (e.pos[1] - me.pos[1]).atan2(e.pos[0] - me.pos[0])).abs() < 0.5);
+                        if !known {
+                            self.fire_heard.push((b, t - f(&snd["age"])));
+                        }
+                    }
+                }
+                if kind != "death" {
                     continue;
                 }
                 let r = match snd["dist"].as_str() {
@@ -902,6 +1031,7 @@ impl Bot {
             }
         }
         self.scav.retain(|x| t - x.1 < 75.0);
+        self.fire_heard.retain(|x| t - x.1 < 15.0);
         self.forget(&me, t);
 
         let zv = &obs["zone"];
@@ -951,7 +1081,16 @@ impl Bot {
             // we never touched, or two attackers while we are still only defending, means the same.
             let wounded_by_others = t < 60.0 && self.enemies.values().any(|e| e.seen >= t - 0.01 && !e.hit_by_me && e.hp < e.max_hp - 350.0);
             let ganged = self.mode == 0 && self.kills == 0 && self.attackers_seen.len() >= 2;
-            if foreign_death || (self.mode == 0 && (wounded_by_others || ganged)) {
+            // The house squad sends one hunter at a time. Shooting heard from two directions well
+            // apart, three shots each, before we have killed anyone, is mechs fighting each other:
+            // in recorded free-for-alls that happens within 5 s for five mechs in six, while the
+            // first death (the old signal) comes at a median of 14 s and often after 20 s.
+            let crossfire = crossfire_on() && self.mode != 2 && self.kills == 0 && t < 45.0 && {
+                let h = &self.fire_heard;
+                let centres: Vec<f32> = h.iter().filter(|a| h.iter().filter(|b| wrap(a.0 - b.0).abs() < 0.35).count() >= 3).map(|a| a.0).collect();
+                centres.iter().any(|a| centres.iter().any(|b| wrap(a - b).abs() >= 1.05))
+            };
+            if foreign_death || crossfire || (self.mode == 0 && (wounded_by_others || ganged)) {
                 self.mode = 2;
             } else if self.mode == 0 && t >= self.tune[9] {
                 self.mode = 1;
@@ -1062,9 +1201,42 @@ impl Bot {
                 evade_from.push(Enemy { id: -1, pos: [p[0], p[1], gz], vel: [0.0; 3], aim: [0.0, 0.0], hp: 1400.0, max_hp: 1400.0, cubes: 0.0, weapons: Vec::new(), seen: t, hurt_me_t: t, hostile_until: t + 1.0, charging: false, facing_since: -1.0, hit_by_me: false });
             }
         }
+        let mut arc_target: Option<Enemy> = None;
         if cautious {
             let hostiles: Vec<&Enemy> = threats.iter().filter(|e| e.hostile_until > t).collect();
-            let engage_ok = match &target {
+            // Lightning against a laser. A beam cannot be dodged, so running from one over open
+            // ground costs a full hit every 2.4 s (we lost 1,400 HP in 12 s that way), but a laser
+            // carrier that lightning keeps hitting cannot charge at all. Shot at by a lone laser
+            // carrier while we hold lightning: run in, and stay inside 45 m until it is dead.
+            if self.mode == 2 && arc_rush_on() && light_s.is_some() && hostiles.len() == 1 {
+                let h = hostiles[0];
+                let d = dxy(&h.pos, &me.pos);
+                let others = threats.iter().filter(|o| o.id != h.id && dxy(&o.pos, &me.pos) < 130.0).count();
+                let going = h.id == self.arc_id && t < self.arc_until;
+                let run = (d - 40.0).max(0.0) / (me.walk * 1.67);
+                let energy_left = me.energy - run * 17.0;
+                let hits = run / 2.4 + 0.6;
+                let burst = energy_left.max(0.0) / 3.0 * 60.0 * 1.45;
+                let start = h.has("laser")
+                    && !h.has("lightning")
+                    && (t - h.hurt_me_t < 3.0 || h.charging)
+                    && others == 0
+                    && d < arc_knob(0)
+                    && energy_left > arc_knob(3)
+                    && me.hp > 350.0 * hits + arc_knob(1)
+                    && h.hp < arc_knob(2) * burst
+                    && self.w.los(muzzle, h.center());
+                if start && !going {
+                    self.arc_id = h.id;
+                    self.arc_until = t + 8.0;
+                }
+                if (start || going) && others == 0 && (d < 45.0 || me.energy > 10.0) && me.hp > 250.0 {
+                    arc_target = Some(h.clone());
+                } else if going {
+                    self.arc_until = -1.0;
+                }
+            }
+            let engage_ok = arc_target.is_some() || match &target {
                 None => false,
                 Some(_) => {
                     let near = threats.iter().filter(|o| dxy(&o.pos, &me.pos) < 130.0).count();
@@ -1357,6 +1529,15 @@ impl Bot {
             mv = Mv::Direct([self.unstick_dir.cos(), self.unstick_dir.sin()], true);
         } else if zone_urgent {
             mv = Mv::Goto(zone_point, !me.in_zone || z.ss - t < travel + 4.0);
+        } else if let Some(h) = &arc_target {
+            let to = [h.pos[0] - here.0, h.pos[1] - here.1];
+            let d = to[0].hypot(to[1]).max(0.1);
+            if d > 34.0 || !self.w.los(muzzle, h.center()) {
+                mv = Mv::Goto((h.pos[0], h.pos[1]), d > 42.0 && me.energy > 14.0);
+            } else {
+                let out = self.strafe_vec(here, me.pos[2], [to[0] / d, to[1] / d], d, 26.0, t, &z);
+                mv = Mv::Direct(out, false);
+            }
         } else if let Some(cm) = cover_mv {
             mv = cm;
         } else if let Some(pm) = peek_mv {
@@ -1547,13 +1728,18 @@ impl Bot {
                         let stale = match self.hide {
                             Some(h) => {
                                 let hp3 = [h.0, h.1, 0.0];
-                                !in_bounds(&hp3) || danger(&hp3) || (self.hide_arrived >= 0.0 && t - self.hide_arrived > self.tune[17]) || t - self.hide_t > 60.0
+                                let hop = if self.mode == 2 && hide_table_on() { hide_knob(1) } else { self.tune[17] };
+                                !in_bounds(&hp3) || danger(&hp3) || (self.hide_arrived >= 0.0 && t - self.hide_arrived > hop) || t - self.hide_t > 60.0
                             }
                             None => true,
                         };
                         if stale {
                             let first = self.hide.is_none();
-                            self.hide = self.pick_hide(&me, &z, t, if first { 0.0 } else { 40.0 }, if first { 60.0 } else { 110.0 });
+                            // Confirmed free-for-all: go by where recorded mechs actually walk and
+                            // look. The enclosed-nook rule below picked spots about five times
+                            // more exposed than the best one in reach.
+                            let by_table = if self.mode == 2 && hide_table_on() { self.pick_hide_risk(&me, &z, t, hide_knob(2)) } else { None };
+                            self.hide = by_table.or_else(|| self.pick_hide(&me, &z, t, if first { 0.0 } else { 40.0 }, if first { 60.0 } else { 110.0 }));
                             self.hide_t = t;
                             self.hide_arrived = -1.0;
                         }
