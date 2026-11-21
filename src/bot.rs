@@ -135,18 +135,18 @@ pub struct Cfg {
     pub policy: u8,
     /// range, retreat hp, retreat hp when outnumbered, retreat in squad mode,
     /// hostile bonus, hp weight, strafe base, strafe spread
-    pub tune: [f32; 16],
+    pub tune: [f32; 20],
 }
 
 impl Cfg {
     /// range, retreat hp, retreat hp when outnumbered, retreat in squad mode, hostile bonus,
     /// hp weight, strafe base, strafe spread, power ratio needed to accept a duel when cautious,
     /// seconds before assuming practice, cornered distance, the same duel ratio while the match type is unknown
-    pub const TUNE: [f32; 16] = [55.0, 0.40, 0.75, 0.0, 40.0, 0.08, 0.45, 0.5, 1.3, 8.0, 40.0, 1.3, 0.0, 0.0, 0.0, 0.0];
+    pub const TUNE: [f32; 20] = [55.0, 0.40, 0.75, 0.0, 40.0, 0.08, 0.45, 0.5, 1.3, 8.0, 40.0, 1.3, 0.0, 0.0, 0.0, 0.0, 0.0, 14.0, 0.0, 0.0];
     pub fn from_env() -> Cfg {
         let mut tune = Self::TUNE;
         if let Ok(e) = std::env::var("MB_TUNE") {
-            for (i, x) in e.split(',').enumerate().take(16) {
+            for (i, x) in e.split(',').enumerate().take(20) {
                 tune[i] = x.parse().unwrap_or(tune[i]);
             }
         }
@@ -186,7 +186,7 @@ pub struct Bot {
     climb_goal: (f32, f32),
     blacklist: HashMap<i64, f32>,
     policy: u8,
-    tune: [f32; 16],
+    tune: [f32; 20],
     kills: i64,
     ghost_t: f32,
     t0: f32,
@@ -470,7 +470,18 @@ impl Bot {
                 if self.npc_mem.values().any(|n| (n.0[0] - x).hypot(n.0[1] - y) < 58.0) {
                     continue;
                 }
-                let score = w.openness(x, y) + 0.35 * d;
+                let mut score = w.openness(x, y) + 0.35 * d;
+                // Optional pulls: toward the rim of the next circle, and away from mechs seen lately.
+                if self.tune[16] != 0.0 {
+                    score -= self.tune[16] * ((x - z.nc[0]).hypot(y - z.nc[1]) / z.nr.max(1.0)).min(1.0) * 30.0;
+                }
+                if self.tune[19] != 0.0 {
+                    for e in self.enemies.values() {
+                        if t - e.seen < 20.0 {
+                            score += self.tune[19] * (1.0 - ((e.pos[0] - x).hypot(e.pos[1] - y) / 250.0).min(1.0)) * 30.0;
+                        }
+                    }
+                }
                 if best.map_or(true, |b| score < b.0) {
                     best = Some((score, (x, y)));
                 }
@@ -1166,7 +1177,7 @@ impl Bot {
                     consider(dxy(&it.pos, &me.pos) * pref, &it.pos, *id, &mut goal);
                 }
             }
-            if hp_frac > 0.85 && calm {
+            if hp_frac > 0.85 && calm && (!cautious || t >= self.tune[18]) {
                 for (id, it) in &self.crates {
                     if in_bounds(&it.pos) && !danger(&it.pos) {
                         consider(dxy(&it.pos, &me.pos) * 1.0 + 10.0, &it.pos, *id, &mut goal);
@@ -1199,7 +1210,7 @@ impl Bot {
                         let stale = match self.hide {
                             Some(h) => {
                                 let hp3 = [h.0, h.1, 0.0];
-                                !in_bounds(&hp3) || danger(&hp3) || (self.hide_arrived >= 0.0 && t - self.hide_arrived > 14.0) || t - self.hide_t > 60.0
+                                !in_bounds(&hp3) || danger(&hp3) || (self.hide_arrived >= 0.0 && t - self.hide_arrived > self.tune[17]) || t - self.hide_t > 60.0
                             }
                             None => true,
                         };
