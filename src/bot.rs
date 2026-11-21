@@ -390,6 +390,14 @@ fn first_shot_knobs() -> [f32; 6] {
     })
 }
 
+/// Last-four rules in a free-for-all (`MB_NOLAST4=1` turns them off): no gun-against-laser trades,
+/// an earlier move into the next circle, and a full look around while walking (three of our
+/// last-four deaths were hits from behind).
+fn last4_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOLAST4").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -1464,7 +1472,16 @@ impl Bot {
                         // one below 40% HP won 71% of recorded fights against 17 to 55% for holding
                         // or leaving.
                         let wounded = self.mode == 2 && finish_on() && hostiles[0].hp < 0.4 * hostiles[0].max_hp && hp_frac > 0.5;
-                        committed || wounded || my_power >= (if self.mode == 0 { self.tune[11] } else { self.tune[8] }) * power(hostiles[0]) || finishable
+                        // Last four, no laser of our own, a laser on us at 50 to 120 m: do not
+                        // trade (most of our 14 real last-four deaths went this way). Leave its
+                        // line of fire unless it is nearly dead.
+                        let dh = dxy(&hostiles[0].pos, &me.pos);
+                        let no_trade = self.mode == 2 && last4_on() && alive <= 4 && laser_s.is_none() && hostiles[0].has("laser") && dh > 50.0 && dh < 120.0;
+                        if no_trade {
+                            wounded || finishable
+                        } else {
+                            committed || wounded || my_power >= (if self.mode == 0 { self.tune[11] } else { self.tune[8] }) * power(hostiles[0]) || finishable
+                        }
                     } else {
                         false
                     }
@@ -1500,7 +1517,10 @@ impl Bot {
         };
         let travel = (d_next - (z.nr - margin)).max(0.0) / me.walk;
         let near_edge = dxy(&[here.0, here.1], &z.c) > z.r - if self.mode == 2 { 20.0 } else { 10.0 };
-        let zone_urgent = !me.in_zone || (!inside_next && (z.ss - t < travel + 12.0 || near_edge));
+        // Last four: head into the next circle 30 s early rather than 12 (one of our last-four
+        // deaths was a full-HP burn outside it).
+        let lead = if self.mode == 2 && last4_on() && alive <= 4 { 30.0 } else { 12.0 };
+        let zone_urgent = !me.in_zone || (!inside_next && (z.ss - t < travel + lead || near_edge));
         let in_bounds = |p: &[f32]| -> bool {
             dxy(p, &z.c) < z.r - 8.0 && (z.ss - t > 25.0 || dxy(p, &z.nc) < z.nr - 4.0)
         };
@@ -2359,7 +2379,7 @@ impl Bot {
             }
             if t - self.t0 < 1.7 {
                 aim = [wrap(self.last_aim[0] + 0.39), 0.0];
-            } else if mvec[0].hypot(mvec[1]) > 0.3 {
+            } else if mvec[0].hypot(mvec[1]) > 0.3 && !(self.mode == 2 && last4_on() && alive <= 4) {
                 let base = mvec[1].atan2(mvec[0]);
                 aim = [wrap(base + 1.5 * (t * 1.4).sin()), 0.0];
             } else {
