@@ -412,6 +412,11 @@ fn foreign_damage_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_FD").is_ok())
 }
 
+fn laser_hunt_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOLHUNT").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -1348,6 +1353,9 @@ impl Bot {
                 self.xf_t = -1.0;
                 self.xf_off = true;
             }
+            if (sure || crossfire2) && self.mode != 2 && std::env::var("MB_MODELOG").is_ok() {
+                eprintln!("MODE2 t={:.1} kills={} foreign_death={}", t, self.kills, foreign_death);
+            }
             if sure || crossfire2 {
                 self.mode = 2;
             } else if self.mode == 0 && t >= self.tune[9] {
@@ -1389,6 +1397,13 @@ impl Bot {
         let gun_s = slot_of("gun");
         let laser_s = slot_of("laser");
         let light_s = slot_of("lightning");
+        // Laser hunt (practice, `MB_LHUNT=1`): past 20 s or our first kill and still without a
+        // laser, getting one comes first. In simulated practice the matches that never hold a
+        // laser score 2.3 against 4.5, and in a quarter of them a laser we had seen was still on
+        // the ground: the 25 s zone rule turned us back 16 m short of one, a drone fight stopped a
+        // walk for 12 s, a mech standing next to us counted as "closer to it", and the swap from
+        // lightning waited for a quiet moment that never came.
+        let lhunt = laser_hunt_on() && self.mode == 1 && laser_s.is_none() && (self.kills >= 1 || t >= 20.0);
         let my_power = me.hp * (1.0 + 0.04 * me.cubes.min(10.0)) * if laser_s.is_some() { 1.3 } else { 1.0 };
         let power = |e: &Enemy| e.hp * (1.0 + 0.04 * e.cubes.min(10.0)) * if e.has("laser") { 1.3 } else { 1.0 };
         let threats: Vec<Enemy> = self.enemies.values().filter(|e| e.seen >= t - 0.01).cloned().collect();
@@ -1623,7 +1638,7 @@ impl Bot {
                 if empty.is_some() {
                     take = p["id"].as_i64();
                 } else if let Some(w1) = &me.wpn[1] {
-                    let upgrade = (w1.kind == "mortar") || (self.tune[12] < 0.5 && w1.kind == "lightning" && kind == "laser" && (threats.is_empty() || self.practice_swap_ok(&me, &threats)));
+                    let upgrade = (w1.kind == "mortar") || (self.tune[12] < 0.5 && w1.kind == "lightning" && kind == "laser" && (threats.is_empty() || lhunt || self.practice_swap_ok(&me, &threats)));
                     if upgrade && w1.charge <= 0.0 {
                         take = p["id"].as_i64();
                         drop = Some(1);
@@ -1721,7 +1736,8 @@ impl Bot {
                 }
             }
         }
-        let practice_rush = if self.mode == 1 && !p_lite { self.practice_weapon_goal(&me, t, laser_s.is_some(), light_s.is_some(), &in_bounds) } else { None };
+        let hunt_bounds = |p: &[f32]| -> bool { in_bounds(p) || (lhunt && dxy(p, &z.c) < z.r - 8.0 && dxy(p, &me.pos) < 80.0) };
+        let practice_rush = if self.mode == 1 && !p_lite { self.practice_weapon_goal(&me, t, laser_s.is_some(), light_s.is_some(), &hunt_bounds, lhunt) } else { None };
 
         // A drone worth shooting: one that is hurting us, or any in reach when things are quiet.
         // Each is 350 HP for two cubes, and its own bullets are slow.
@@ -1913,7 +1929,7 @@ impl Bot {
                 Some(g) => Mv::Goto(g, me.energy > 30.0),
                 None => Mv::Goto(zone_point, false),
             };
-        } else if let (Some(n), true) = (shoot_npc, drone_hot || threats.is_empty()) {
+        } else if let (Some(n), true) = (shoot_npc, (drone_hot || threats.is_empty()) && !(lhunt && practice_rush.is_some())) {
             // Circle the drone at a distance where its slow bullets miss a moving mech.
             let to = [n.0[0] - here.0, n.0[1] - here.1];
             let d = to[0].hypot(to[1]).max(0.1);
@@ -2527,7 +2543,8 @@ impl Bot {
             for e in &threats {
                 es += &format!(" [d{:.0} hp{:.0} {}{}]", dxy(&e.pos, &me.pos), e.hp, if e.hostile_until > t { "H" } else { "n" }, if self.w.los(e.eye(), my_center) { "L" } else { "-" });
             }
-            self.dbg = format!("mode{} hp{:.0} {} retreat={} cover={:?} tgt={} fire={:?} thr:{}", self.mode, me.hp, mvk, self.retreating, self.cover.map(|c| (c.0 as i32, c.1 as i32)), target.is_some(), fire, es);
+            let lasers: Vec<String> = self.pickups.iter().filter(|(_, it)| it.kind == "laser").map(|(id, it)| format!("{}@{:.0}m{}{}", id, dxy(&it.pos, &me.pos), if self.blacklist.get(id).map_or(false, |u| t < *u) { "B" } else { "" }, if (it.pos[2] - self.w.surf_at(it.pos[0], it.pos[1])).abs() > 2.0 { "R" } else { "" })).collect();
+            self.dbg = format!("mode{} hp{:.0} {} retreat={} cover={:?} tgt={} fire={:?} w1={} pr={:?} plite={} L[{}] thr:{}", self.mode, me.hp, mvk, self.retreating, self.cover.map(|c| (c.0 as i32, c.1 as i32)), target.is_some(), fire, me.wpn[1].as_ref().map_or("-".to_string(), |w| w.kind.clone()), practice_rush.map(|c| (c.0 as i32, c.2)), p_lite, lasers.join(","), es);
         }
         let r3 = |x: f32| (x * 1000.0).round() / 1000.0;
         let mut a = Map::new();
