@@ -2047,7 +2047,7 @@ impl Bot {
                 0.0
             }
         };
-        let timed_hold = self.mode == 2 && std::env::var("MB_NOTIMEDHOLD").is_err();
+        let timed_hold = std::env::var("MB_NOTIMEDHOLD").is_err();
         let mut fire = [false, false];
         let mut laser_release = false;
         let mut aim;
