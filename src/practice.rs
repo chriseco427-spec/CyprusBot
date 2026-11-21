@@ -8,11 +8,11 @@ use std::sync::OnceLock;
 /// 0: laser rush on (1) / off (0)   1: laser reach m   2: lightning reach m   3: roof penalty m
 /// 4: trade lightning for a laser (1) / keep it (0)   5: no enemy closer than this (m) while swapping
 /// 6: skip weapons another mech is nearer to (1) / ignore (0)   7: margin m for that test
-/// 8: only apply that test before this match time (s)
+/// 8: only apply that test before this match time (s)   9: highest roof (m above us) worth a climb
 pub(super) fn knob(i: usize) -> f32 {
     static K: OnceLock<[f32; 10]> = OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 0.0];
+        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0];
         if let Ok(e) = std::env::var("PR_TUNE") {
             for (j, x) in e.split(',').enumerate().take(10) {
                 k[j] = x.parse().unwrap_or(k[j]);
@@ -48,7 +48,7 @@ impl Bot {
             // Ground pickups, or roofs low enough to jet onto from nearby.
             let ground = self.w.surf_at(it.pos[0], it.pos[1]);
             let roof = (it.pos[2] - ground).abs() > 2.0 || it.pos[2] - me.pos[2] > 3.0;
-            if d > reach || (roof && it.pos[2] - me.pos[2] > 40.0) {
+            if d > reach || (roof && it.pos[2] - me.pos[2] > knob(9)) {
                 continue;
             }
             // Leave a weapon another mech is closer to. Insurance for a free-for-all mistaken for
