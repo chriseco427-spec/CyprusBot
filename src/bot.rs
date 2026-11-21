@@ -74,6 +74,7 @@ struct Me {
 
 #[derive(Clone)]
 struct Enemy {
+    id: i64,
     pos: [f32; 3],
     vel: [f32; 3],
     aim: [f32; 2],
@@ -141,7 +142,7 @@ impl Cfg {
     /// range, retreat hp, retreat hp when outnumbered, retreat in squad mode, hostile bonus,
     /// hp weight, strafe base, strafe spread, power ratio needed to accept a duel when cautious,
     /// seconds before assuming practice, cornered distance, the same duel ratio while the match type is unknown
-    pub const TUNE: [f32; 16] = [55.0, 0.40, 0.75, 0.0, 40.0, 0.08, 0.4, 0.9, 1.3, 8.0, 40.0, 1.3, 0.0, 0.0, 0.0, 0.0];
+    pub const TUNE: [f32; 16] = [55.0, 0.40, 0.75, 0.0, 40.0, 0.08, 0.45, 0.5, 1.3, 8.0, 40.0, 1.3, 0.0, 0.0, 0.0, 0.0];
     pub fn from_env() -> Cfg {
         let mut tune = Self::TUNE;
         if let Ok(e) = std::env::var("MB_TUNE") {
@@ -188,6 +189,8 @@ pub struct Bot {
     tune: [f32; 16],
     kills: i64,
     ghost_t: f32,
+    /// Recent (time, position, velocity) per enemy, to judge how predictable its movement is.
+    hist: HashMap<i64, Vec<(f32, [f32; 3], [f32; 3])>>,
     foreign_since: f32,
     i_hit: Vec<i64>,
     attackers_seen: Vec<i64>,
@@ -275,6 +278,7 @@ impl Bot {
             mode: if cfg.mode == 0 { 0 } else { cfg.mode },
             kills: 0,
             ghost_t: -100.0,
+            hist: HashMap::new(),
             foreign_since: -1.0,
             i_hit: Vec::new(),
             attackers_seen: Vec::new(),
@@ -504,6 +508,60 @@ impl Bot {
         ([n[0] * s, n[1] * s], at_end)
     }
 
+    /// How much of the target's velocity to lead by. Plain linear lead is best against most
+    /// movement, but a mech that reverses every half second is closer to where it was than to
+    /// where its velocity points; its own recent track tells us which.
+    fn lead_factor(&self, id: i64, tof: f32, t: f32) -> f32 {
+        let h = match self.hist.get(&id) {
+            Some(h) if h.len() >= 12 => h,
+            _ => return 1.0,
+        };
+        const KS: [f32; 4] = [1.0, 0.7, 0.4, 0.0];
+        let mut hits = [0i32; 4];
+        let mut n = 0;
+        for i in 0..h.len() {
+            let tt = h[i].0 + tof;
+            if tt > t + 0.01 || t - h[i].0 > 2.6 {
+                continue;
+            }
+            let mut j = i;
+            while j + 1 < h.len() && h[j].0 < tt - 0.05 {
+                j += 1;
+            }
+            if (h[j].0 - tt).abs() > 0.12 {
+                continue;
+            }
+            for (q, k) in KS.iter().enumerate() {
+                let px = h[i].1[0] + h[i].2[0] * tof * k;
+                let py = h[i].1[1] + h[i].2[1] * tof * k;
+                if (px - h[j].1[0]).hypot(py - h[j].1[1]) < 2.4 {
+                    hits[q] += 1;
+                }
+            }
+            n += 1;
+        }
+        if n < 8 {
+            return 1.0;
+        }
+        let mut best = 0;
+        for q in 1..4 {
+            if hits[q] > hits[best] + 1 {
+                best = q;
+            }
+        }
+        KS[best]
+    }
+
+    /// Nothing taller than a step within a few metres this way (walls only; drops are fine).
+    fn open_dir(&self, here: (f32, f32), z: f32, v: [f32; 2]) -> bool {
+        for s in [1.5f32, 3.0, 4.5] {
+            if self.w.surf_at(here.0 + v[0] * s, here.1 + v[1] * s) > z + 1.2 {
+                return false;
+            }
+        }
+        true
+    }
+
     fn upgrade_score(id: &str) -> i32 {
         match id {
             "plating" => 100,
@@ -555,6 +613,7 @@ impl Bot {
                 self.enemies.insert(
                     id,
                     Enemy {
+                        id,
                         pos: v3(&m["pos"]),
                         vel: v3(&m["vel"]),
                         aim: [f(&m["aim"][0]), f(&m["aim"][1])],
@@ -607,6 +666,16 @@ impl Bot {
                 }
             }
         }
+        for (id, e) in &self.enemies {
+            if e.seen >= t - 0.01 {
+                let h = self.hist.entry(*id).or_default();
+                h.push((t, e.pos, e.vel));
+                if h.len() > 32 {
+                    h.remove(0);
+                }
+            }
+        }
+        self.hist.retain(|_, h| h.last().map_or(false, |x| t - x.0 < 6.0));
         self.enemies.retain(|_, e| t - e.seen < 20.0);
         Self::remember(&mut self.pickups, &obs["pickups"], t);
         Self::remember(&mut self.crates, &obs["crates"], t);
@@ -728,7 +797,7 @@ impl Bot {
             if t - self.ghost_t < 3.0 && !threats.iter().any(|e| e.hostile_until > t) {
                 let p = [me.pos[0] + 110.0 * self.hurt_bearing.cos(), me.pos[1] + 110.0 * self.hurt_bearing.sin()];
                 let gz = self.w.surf_at(p[0], p[1]);
-                evade_from.push(Enemy { pos: [p[0], p[1], gz], vel: [0.0; 3], aim: [0.0, 0.0], hp: 1400.0, max_hp: 1400.0, cubes: 0.0, weapons: Vec::new(), seen: t, hurt_me_t: t, hostile_until: t + 1.0, charging: false, facing_since: -1.0, hit_by_me: false });
+                evade_from.push(Enemy { id: -1, pos: [p[0], p[1], gz], vel: [0.0; 3], aim: [0.0, 0.0], hp: 1400.0, max_hp: 1400.0, cubes: 0.0, weapons: Vec::new(), seen: t, hurt_me_t: t, hostile_until: t + 1.0, charging: false, facing_since: -1.0, hit_by_me: false });
             }
         }
         if cautious {
@@ -819,19 +888,19 @@ impl Bot {
         }
 
         // Nearest cube we can walk to: worth grabbing even mid-fight (HP, damage, upgrades).
-        let mut near_cube: Option<(f32, (f32, f32))> = None;
+        let mut near_cube: Option<(f32, (f32, f32), i64)> = None;
         for (id, it) in &self.cubes {
             if self.blacklist.get(id).map_or(false, |u| t < *u) {
                 continue;
             }
             let d = dxy(&it.pos, &me.pos);
             if d < 75.0 && in_bounds(&it.pos) && (it.pos[2] - me.pos[2]).abs() < 5.0 && near_cube.map_or(true, |c| d < c.0) {
-                near_cube = Some((d, (it.pos[0], it.pos[1])));
+                near_cube = Some((d, (it.pos[0], it.pos[1]), *id));
             }
         }
 
         // Nearest weapon worth having while slot 1 is empty.
-        let mut near_gun: Option<(f32, (f32, f32))> = None;
+        let mut near_gun: Option<(f32, (f32, f32), i64)> = None;
         if me.wpn[1].is_none() || (self.tune[12] > 0.5 && gun_s.is_some()) {
             for (id, it) in &self.pickups {
                 if self.blacklist.get(id).map_or(false, |u| t < *u) || !(it.kind == "laser" || it.kind == "lightning") || slot_of(&it.kind).is_some() {
@@ -839,7 +908,7 @@ impl Bot {
                 }
                 let d = dxy(&it.pos, &me.pos);
                 if d < 60.0 && in_bounds(&it.pos) && (it.pos[2] - me.pos[2]).abs() < 5.0 && near_gun.map_or(true, |c| d < c.0) {
-                    near_gun = Some((d, (it.pos[0], it.pos[1])));
+                    near_gun = Some((d, (it.pos[0], it.pos[1]), *id));
                 }
             }
         }
@@ -919,9 +988,11 @@ impl Bot {
         } else if let Some(c) = flee_goal {
             mv = Mv::Goto(c, me.energy > 12.0);
         } else if let (Some(c), true) = (near_gun, !threats.is_empty() && !self.retreating) {
+            goal_id = Some(c.2);
             mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
         } else if let (Some(c), true) = (near_cube, !threats.is_empty() && !self.retreating) {
             // Fighting or stalking with a cube in reach: collect it while we shoot.
+            goal_id = Some(c.2);
             mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
         } else if let Some(e) = &target {
             // Fight: strafe around the target at the range our weapons like.
@@ -935,22 +1006,34 @@ impl Bot {
                 range = 65.0;
             }
             if t >= self.strafe_until {
-                if self.rand() < 0.6 {
+                if self.rand() < 0.85 {
                     self.strafe_dir = -self.strafe_dir;
                 }
                 self.strafe_until = t + self.tune[6] + self.tune[7] * self.rand();
             }
             let radial = ((d - range) / 20.0).clamp(-1.0, 1.0) * 0.8;
+            let sd = self.strafe_dir;
+            let px = [-dir[1] * sd, dir[0] * sd];
+            // Preferred strafe first, then anything else that is open: standing still loses duels.
+            let cands = [
+                [px[0] + dir[0] * radial, px[1] + dir[1] * radial],
+                [-px[0] + dir[0] * radial, -px[1] + dir[1] * radial],
+                px,
+                [-px[0], -px[1]],
+                [px[0] - dir[0] * 0.7, px[1] - dir[1] * 0.7],
+                [-px[0] - dir[0] * 0.7, -px[1] - dir[1] * 0.7],
+                [-dir[0], -dir[1]],
+                dir,
+            ];
             let mut out = [0.0, 0.0];
-            for attempt in 0..2 {
-                let s = self.strafe_dir;
-                let v = norm2([-dir[1] * s + dir[0] * radial, dir[0] * s + dir[1] * radial]);
-                if self.w.walkable_line(here, (here.0 + v[0] * 4.0, here.1 + v[1] * 4.0)) && in_bounds(&[here.0 + v[0] * 4.0, here.1 + v[1] * 4.0]) {
+            for (k, c) in cands.iter().enumerate() {
+                let v = norm2(*c);
+                if self.open_dir(here, me.pos[2], v) && in_bounds(&[here.0 + v[0] * 4.0, here.1 + v[1] * 4.0]) {
                     out = v;
+                    if k == 1 || k == 3 || k == 5 {
+                        self.strafe_dir = -sd;
+                    }
                     break;
-                }
-                if attempt == 0 {
-                    self.strafe_dir = -self.strafe_dir;
                 }
             }
             let burst = me.energy > 55.0 && (t * 1.3).sin() > 0.3;
@@ -1144,10 +1227,15 @@ impl Bot {
             self.stuck_t = t;
         } else if t - self.stuck_t >= 1.0 {
             if d3(me.pos, self.stuck_pos) < 0.8 {
-                self.unstick_until = t + 0.7;
-                self.unstick_dir = self.rand() * TAU;
                 self.path.clear();
-                jump = true;
+                if let (Some(id), false) = (goal_id, threats.is_empty()) {
+                    // Blocked on the way to loot with enemies about: forget it, keep fighting.
+                    self.blacklist.insert(id, t + 25.0);
+                } else {
+                    self.unstick_until = t + 0.7;
+                    self.unstick_dir = self.rand() * TAU;
+                    jump = true;
+                }
             }
             self.stuck_pos = me.pos;
             self.stuck_t = t;
@@ -1169,11 +1257,11 @@ impl Bot {
         if let Some(e) = &target {
             let c0 = e.center();
             let speed = gun_s.and_then(|s| me.wpn[s].as_ref()).map_or(252.0, |w| w.speed);
+            let lead_k = self.lead_factor(e.id, d3(muzzle, c0) / speed + 0.05, t);
             let mut p = c0;
             for _ in 0..4 {
-                // Plain linear lead: it scored best against recorded opponent movement at every range.
                 let tt = d3(muzzle, p) / speed + 0.05;
-                p = [c0[0] + e.vel[0] * tt, c0[1] + e.vel[1] * tt, c0[2] + (e.vel[2] * tt).clamp(-2.0, 2.0)];
+                p = [c0[0] + e.vel[0] * tt * lead_k, c0[1] + e.vel[1] * tt * lead_k, c0[2] + (e.vel[2] * tt * lead_k).clamp(-2.0, 2.0)];
             }
             let direct = [c0[0] + e.vel[0] * 0.08, c0[1] + e.vel[1] * 0.08, c0[2]];
             let d = d3(muzzle, c0);
