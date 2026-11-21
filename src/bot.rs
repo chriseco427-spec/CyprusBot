@@ -60,6 +60,7 @@ struct Me {
     hp: f32,
     max_hp: f32,
     energy: f32,
+    max_energy: f32,
     grounded: bool,
     in_zone: bool,
     walk: f32,
@@ -145,6 +146,9 @@ pub struct Bot {
     wander: Option<(f32, f32)>,
     wander_t: f32,
     last_aim: [f32; 2],
+    climb_until: f32,
+    climb_goal: (f32, f32),
+    blacklist: HashMap<i64, f32>,
 }
 
 impl Bot {
@@ -200,6 +204,9 @@ impl Bot {
             wander: None,
             wander_t: -100.0,
             last_aim: [0.0, 0.0],
+            climb_until: -1.0,
+            climb_goal: (0.0, 0.0),
+            blacklist: HashMap::new(),
         }
     }
 
@@ -239,6 +246,7 @@ impl Bot {
             hp: f(&s["hp"]),
             max_hp: f(&s["max_hp"]).max(1.0),
             energy: f(&s["energy"]),
+            max_energy: s["max_energy"].as_f64().unwrap_or(100.0) as f32,
             grounded: s["grounded"].as_bool().unwrap_or(true),
             in_zone: s["in_zone"].as_bool().unwrap_or(true),
             walk: g("walk_speed", 11.7),
@@ -319,7 +327,7 @@ impl Bot {
         best.map(|b| b.1)
     }
 
-    fn follow(&mut self, me: &Me, goal: (f32, f32), t: f32) -> [f32; 2] {
+    fn follow(&mut self, me: &Me, goal: (f32, f32), t: f32) -> ([f32; 2], bool) {
         let here = (me.pos[0], me.pos[1]);
         let need = self.path.is_empty()
             || (goal.0 - self.path_goal.0).hypot(goal.1 - self.path_goal.1) > 4.0
@@ -332,7 +340,7 @@ impl Bot {
             self.path_i = 0;
         }
         if self.path.is_empty() {
-            return norm2([goal.0 - here.0, goal.1 - here.1]);
+            return (norm2([goal.0 - here.0, goal.1 - here.1]), false);
         }
         while self.path_i + 1 < self.path.len() && (self.path[self.path_i].0 - here.0).hypot(self.path[self.path_i].1 - here.1) < 2.4 {
             self.path_i += 1;
@@ -348,12 +356,14 @@ impl Bot {
             k -= 1;
         }
         let d = (tgt.0 - here.0).hypot(tgt.1 - here.1);
+        let last = self.path[self.path.len() - 1];
+        let at_end = self.path_i + 1 >= self.path.len() && (last.0 - here.0).hypot(last.1 - here.1) < 2.5;
         if d < 0.6 {
-            return [0.0, 0.0];
+            return ([0.0, 0.0], at_end);
         }
         let s = if d < 2.0 && self.path_i + 1 >= self.path.len() { 0.5 } else { 1.0 };
         let n = norm2([tgt.0 - here.0, tgt.1 - here.1]);
-        [n[0] * s, n[1] * s]
+        ([n[0] * s, n[1] * s], at_end)
     }
 
     fn upgrade_score(id: &str) -> i32 {
@@ -536,6 +546,7 @@ impl Bot {
 
         // ---- movement
         let mut shoot_crate: Option<[f32; 3]> = None;
+        let mut goal_id: Option<i64> = None;
         let mv: Mv;
         let cornered = target.as_ref().map_or(false, |e| d3(muzzle, e.center()) < 40.0);
         if t < self.unstick_until {
@@ -620,10 +631,14 @@ impl Bot {
             }
         } else {
             // Idle: supply drop, cubes, weapons, crates, then explore inside the next circle.
-            let mut goal: Option<(f32, (f32, f32))> = None;
-            let consider = |score: f32, p: &[f32; 3], goal: &mut Option<(f32, (f32, f32))>| {
+            let mut goal: Option<(f32, (f32, f32), i64)> = None;
+            let bl = &self.blacklist;
+            let consider = |score: f32, p: &[f32; 3], id: i64, goal: &mut Option<(f32, (f32, f32), i64)>| {
+                if bl.get(&id).map_or(false, |u| t < *u) {
+                    return;
+                }
                 if goal.map_or(true, |g| score < g.0) {
-                    *goal = Some((score, (p[0], p[1])));
+                    *goal = Some((score, (p[0], p[1]), id));
                 }
             };
             if let Some(ds) = obs["drops"].as_array() {
@@ -631,29 +646,29 @@ impl Bot {
                     let p = v3(&d["pos"]);
                     let dist = dxy(&p, &me.pos);
                     if in_bounds(&p) && dist < 300.0 && f(&d["lands_in"]) < dist / me.walk + 10.0 {
-                        consider(dist * 0.4, &p, &mut goal);
+                        consider(dist * 0.4, &p, d["id"].as_i64().unwrap_or(-1), &mut goal);
                     }
                 }
             }
-            for it in self.cubes.values() {
+            for (id, it) in &self.cubes {
                 if in_bounds(&it.pos) && (it.pos[2] - me.pos[2]).abs() < 6.0 {
-                    consider(dxy(&it.pos, &me.pos) * 0.5, &it.pos, &mut goal);
+                    consider(dxy(&it.pos, &me.pos) * 0.5, &it.pos, *id, &mut goal);
                 }
             }
             let want_laser = laser_s.is_none();
             let slot_free = me.wpn[1].is_none() || me.wpn[0].is_none();
-            for it in self.pickups.values() {
+            for (id, it) in &self.pickups {
                 let wanted = (slot_free && (it.kind == "laser" || it.kind == "lightning") && slot_of(&it.kind).is_none())
                     || (!slot_free && want_laser && it.kind == "laser" && light_s.is_some());
                 if wanted && in_bounds(&it.pos) && (it.pos[2] - self.w.surf_at(it.pos[0], it.pos[1])).abs() < 2.0 {
                     let pref = if it.kind == "laser" { 0.6 } else { 0.8 };
-                    consider(dxy(&it.pos, &me.pos) * pref, &it.pos, &mut goal);
+                    consider(dxy(&it.pos, &me.pos) * pref, &it.pos, *id, &mut goal);
                 }
             }
             if hp_frac > 0.85 {
-                for it in self.crates.values() {
+                for (id, it) in &self.crates {
                     if in_bounds(&it.pos) {
-                        consider(dxy(&it.pos, &me.pos) * 1.0 + 10.0, &it.pos, &mut goal);
+                        consider(dxy(&it.pos, &me.pos) * 1.0 + 10.0, &it.pos, *id, &mut goal);
                         let c = [it.pos[0], it.pos[1], it.pos[2] + 1.2];
                         let dd = d3(muzzle, c);
                         if dd < 70.0 && self.w.los(muzzle, c) && shoot_crate.map_or(true, |s| dd < d3(muzzle, s)) {
@@ -665,12 +680,15 @@ impl Bot {
             if let Some(c) = shoot_crate {
                 // Close enough to shoot; keep walking in until 20 m so the cube is near.
                 if d3(muzzle, c) < 20.0 {
-                    goal = Some((0.0, here));
+                    goal = Some((0.0, here, -1));
                 }
             }
             match goal {
-                Some((_, g)) if g == here => mv = Mv::Hold,
-                Some((_, g)) => mv = Mv::Goto(g, false),
+                Some((_, g, _)) if g == here => mv = Mv::Hold,
+                Some((_, g, id)) => {
+                    goal_id = Some(id);
+                    mv = Mv::Goto(g, false);
+                }
                 None => {
                     if !inside_next {
                         mv = Mv::Goto(zone_point, false);
@@ -702,12 +720,59 @@ impl Bot {
             }
         }
 
+        let mut jump = false;
         let (mut mvec, mut boost) = match mv {
-            Mv::Goto(g, b) => (self.follow(&me, g, t), b),
+            Mv::Goto(g, b) => {
+                let (v, at_end) = self.follow(&me, g, t);
+                let mut out = (v, b);
+                let gc = self.w.cell(g.0, g.1);
+                let gs = self.w.surf[gc];
+                let dgoal = (g.0 - here.0).hypot(g.1 - here.1);
+                let roof_goal = self.w.prism[gc] && gs > me.pos[2] + 1.5;
+                if at_end && dgoal > 2.5 && me.grounded {
+                    if roof_goal && dgoal < 60.0 {
+                        // The goal is on a roof we cannot walk onto: jet up from here.
+                        self.climb_until = t + 9.0;
+                        self.climb_goal = g;
+                    } else if let Some(id) = goal_id {
+                        self.blacklist.insert(id, t + 90.0);
+                    }
+                }
+                if t < self.climb_until && (self.climb_goal.0 - g.0).hypot(self.climb_goal.1 - g.1) < 3.0 {
+                    if me.grounded && !roof_goal {
+                        self.climb_until = -1.0;
+                    } else {
+                        let dir = norm2([g.0 - here.0, g.1 - here.1]);
+                        let mut wall_top = me.pos[2];
+                        let reach = dgoal.min(8.0);
+                        let mut s = 1.0;
+                        while s <= reach {
+                            wall_top = wall_top.max(self.w.surf_at(here.0 + dir[0] * s, here.1 + dir[1] * s));
+                            s += 1.0;
+                        }
+                        if me.grounded {
+                            let need = (wall_top - me.pos[2] - 2.0).max(0.0) * 1.7 + 8.0;
+                            if need > me.max_energy {
+                                self.climb_until = -1.0;
+                                if let Some(id) = goal_id {
+                                    self.blacklist.insert(id, t + 300.0);
+                                }
+                            } else if me.energy >= need {
+                                jump = true;
+                                out = (dir, false);
+                            } else {
+                                out = ([0.0, 0.0], false);
+                            }
+                        } else {
+                            out = (dir, me.pos[2] < wall_top + 0.8);
+                        }
+                    }
+                }
+                out
+            }
             Mv::Direct(v, b) => (v, b),
             Mv::Hold => ([0.0, 0.0], false),
         };
-        let mut jump = false;
 
         // ---- stuck detection (only when we mean to travel)
         let travelling = matches!(mv, Mv::Goto(..)) && mvec[0].hypot(mvec[1]) > 0.6;
