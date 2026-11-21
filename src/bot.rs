@@ -1672,10 +1672,14 @@ impl Bot {
             let d = to[0].hypot(to[1]).max(0.1);
             let dir = [to[0] / d, to[1] / d];
             let mut range = self.tune[0];
+            if self.mode == 1 && practice::knob(15) > 0.0 {
+                range = practice::knob(15);
+            }
             if light_s.is_some() && me.energy > 25.0 {
                 range = 30.0;
             } else if e.has("lightning") {
-                range = 65.0;
+                // Practice: keep the long range from lightning carriers too (their arc reaches 45 m).
+                range = if self.mode == 1 && practice::knob(15) > 0.0 { range.max(65.0) } else { 65.0 };
             }
             let out = self.strafe_vec(here, me.pos[2], dir, d, range, t, &z);
             let burst = me.energy > 55.0 && (t * 1.3).sin() > 0.3;

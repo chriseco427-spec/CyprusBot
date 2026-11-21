@@ -12,12 +12,14 @@ use std::sync::OnceLock;
 /// 12: follow up a hunter we wounded below this HP fraction (0 = off)   13: only while our HP
 ///     fraction is above this
 /// 14: offense-first upgrades in practice (1) / shared order (0)
+/// 15: distance (m) to keep from hunters while fighting in practice (0 = shared default). House
+///     experts hit 41% with the gun at 60-120 m but 17% at 120-200 m; our laser is hitscan.
 pub(super) fn knob(i: usize) -> f32 {
-    static K: OnceLock<[f32; 15]> = OnceLock::new();
+    static K: OnceLock<[f32; 16]> = OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.65, 0.5, 1.0];
+        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.65, 0.5, 1.0, 180.0];
         if let Ok(e) = std::env::var("PR_TUNE") {
-            for (j, x) in e.split(',').enumerate().take(15) {
+            for (j, x) in e.split(',').enumerate().take(16) {
                 k[j] = x.parse().unwrap_or(k[j]);
             }
         }
