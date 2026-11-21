@@ -189,6 +189,7 @@ pub struct Bot {
     tune: [f32; 16],
     kills: i64,
     ghost_t: f32,
+    t0: f32,
     /// Drones seen this match: last position and when.
     npc_mem: HashMap<i64, ([f32; 3], f32)>,
     npc_hurt_t: f32,
@@ -281,6 +282,7 @@ impl Bot {
             mode: if cfg.mode == 0 { 0 } else { cfg.mode },
             kills: 0,
             ghost_t: -100.0,
+            t0: -1.0,
             npc_mem: HashMap::new(),
             npc_hurt_t: -100.0,
             hist: HashMap::new(),
@@ -799,10 +801,6 @@ impl Bot {
         let power = |e: &Enemy| e.hp * (1.0 + 0.04 * e.cubes.min(10.0)) * if e.has("laser") { 1.3 } else { 1.0 };
         let threats: Vec<Enemy> = self.enemies.values().filter(|e| e.seen >= t - 0.01).cloned().collect();
         let any_hostile = threats.iter().any(|e| e.hostile_until > t);
-        // Practice: between hunters, stop picking fights and get out of sight so we regenerate
-        // before the next ones arrive.
-        let hostile_los = threats.iter().any(|e| e.hostile_until > t && self.w.los(e.eye(), my_center));
-        let p_rest = self.mode == 1 && self.tune[3] < 0.5 && hp_frac < self.tune[13] && !hostile_los;
 
         // ---- target: best enemy we have a line of fire to
         let mut target: Option<Enemy> = None;
@@ -832,7 +830,7 @@ impl Bot {
                 match self.policy {
                     1 => e.hostile_until > t,
                     2 => e.hostile_until > t || (!any_hostile && hp_frac > 0.9),
-                    _ => !p_rest || e.hostile_until > t || e.hp <= 180.0,
+                    _ => true,
                 }
             };
             if allowed && d < 260.0 && self.w.los(muzzle, e.center()) {
@@ -883,11 +881,7 @@ impl Bot {
             }
             self.retreating = evade;
         } else if self.tune[3] < 0.5 {
-            let rest = p_rest && !finishable && target.is_none();
-            if rest && !self.retreating {
-                self.cover = None;
-            }
-            self.retreating = rest;
+            self.retreating = false;
         } else if !self.retreating {
             if !threats.is_empty() && !finishable && (hp_frac < self.tune[1] || (attackers >= 2 && hp_frac < self.tune[2])) {
                 self.retreating = true;
@@ -975,6 +969,33 @@ impl Bot {
             }
         }
 
+        // Weapon rush: with only the gun, a laser or lightning we can reach before anyone else
+        // comes first, ahead of hiding. The teams that win free-for-alls are armed within seconds.
+        let mut rush: Option<(f32, (f32, f32), i64)> = None;
+        if self.tune[13] < 0.5 && me.wpn[1].is_none() {
+            for (id, it) in &self.pickups {
+                if self.blacklist.get(id).map_or(false, |u| t < *u) || !(it.kind == "laser" || it.kind == "lightning") {
+                    continue;
+                }
+                let d = dxy(&it.pos, &me.pos);
+                let climb = (it.pos[2] - me.pos[2]).max(0.0);
+                if d > 130.0 || climb > 14.0 || !in_bounds(&it.pos) {
+                    continue;
+                }
+                // Someone else closer to it, or a shooter between us and a long run: leave it.
+                if self.enemies.values().any(|e| t - e.seen < 6.0 && dxy(&e.pos, &it.pos) < d + 15.0) {
+                    continue;
+                }
+                if d > 40.0 && threats.iter().any(|e| e.hostile_until > t && self.w.los(e.eye(), my_center)) {
+                    continue;
+                }
+                let score = d * if it.kind == "laser" { 0.7 } else { 1.0 } + climb * 3.0;
+                if rush.map_or(true, |r| score < r.0) {
+                    rush = Some((score, (it.pos[0], it.pos[1]), *id));
+                }
+            }
+        }
+
         // A drone worth shooting: one that is hurting us, or any in reach when things are quiet.
         // Each is 350 HP for two cubes, and its own bullets are slow.
         let quiet = threats.is_empty() && (!cautious || self.enemies.values().all(|e| t - e.seen > 8.0));
@@ -1009,7 +1030,7 @@ impl Bot {
                     None => true,
                 };
                 if exposed && t - self.cover_t > 0.5 {
-                    self.cover = if cautious || p_rest {
+                    self.cover = if cautious {
                         // Prefer cover that survives a sidestep; widen and relax if there is none.
                         let hostile_only: Vec<Enemy> = evade_from.iter().filter(|e| e.hostile_until > t).cloned().collect();
                         self.find_cover(&me, &evade_from, &z, true, 60.0, 4.0)
@@ -1029,7 +1050,7 @@ impl Bot {
                         }
                     }
                     None => {
-                        if !(cautious || p_rest) {
+                        if !cautious {
                             // No cover in reach: run from the nearest threat, staying in the zone.
                             let e = evade_from.iter().min_by(|a, b| dxy(&a.pos, &me.pos).partial_cmp(&dxy(&b.pos, &me.pos)).unwrap()).unwrap();
                             let away = norm2([here.0 - e.pos[0], here.1 - e.pos[1]]);
@@ -1060,6 +1081,9 @@ impl Bot {
             mv = Mv::Direct([self.unstick_dir.cos(), self.unstick_dir.sin()], true);
         } else if zone_urgent {
             mv = Mv::Goto(zone_point, !me.in_zone || z.ss - t < travel + 4.0);
+        } else if let (Some(r), false) = (rush, cornered) {
+            goal_id = Some(r.2);
+            mv = Mv::Goto(r.1, me.energy > 15.0);
         } else if flee_hold {
             mv = Mv::Hold;
         } else if let Some(c) = flee_goal {
@@ -1401,8 +1425,14 @@ impl Bot {
                 }
             }
         } else {
-            // Scan: sweep around the direction of travel, or spin when standing.
-            if mvec[0].hypot(mvec[1]) > 0.3 {
+            // Scan: a full turn at the start to see what is around the spawn, then sweep around
+            // the direction of travel, or spin when standing.
+            if self.t0 < 0.0 {
+                self.t0 = t;
+            }
+            if t - self.t0 < 1.7 {
+                aim = [wrap(self.last_aim[0] + 0.39), 0.0];
+            } else if mvec[0].hypot(mvec[1]) > 0.3 {
                 let base = mvec[1].atan2(mvec[0]);
                 aim = [wrap(base + 1.5 * (t * 1.4).sin()), 0.0];
             } else {
