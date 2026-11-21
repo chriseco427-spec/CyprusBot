@@ -392,6 +392,13 @@ fn xf_revert_s() -> f32 {
     *K.get_or_init(|| std::env::var("MB_XFREVERT").ok().and_then(|v| v.parse().ok()).unwrap_or(18.0))
 }
 
+/// Free-for-all evidence from damage seen on other mechs (`MB_FD=1` turns it on; off by default
+/// until a practice submission repeats the pick's score exactly).
+fn foreign_damage_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_FD").is_ok())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -433,6 +440,11 @@ pub struct Bot {
     escape_until: f32,
     /// Replay marker (look straight up for 0.4 s once, on confirmed free-for-all): when it ran.
     marker_t: f32,
+    /// Damage seen on other mechs that we did not deal (free-for-all evidence).
+    fd_cand: Vec<(i64, f32)>,
+    fd_small: Vec<f32>,
+    fd_big: bool,
+    my_hit_t: HashMap<i64, f32>,
     /// Free-for-all set by the volume rule alone (when), and whether that was undone.
     xf_t: f32,
     xf_off: bool,
@@ -575,6 +587,10 @@ impl Bot {
             climb_until: -1.0,
             escape_until: -1.0,
             marker_t: -1.0,
+            fd_cand: Vec::new(),
+            fd_small: Vec::new(),
+            fd_big: false,
+            my_hit_t: HashMap::new(),
             xf_t: -1.0,
             xf_off: false,
             drop_avoid: Vec::new(),
@@ -1037,6 +1053,7 @@ impl Bot {
 
     pub fn decide(&mut self, obs: &Value) -> Value {
         let t = f(&obs["t"]);
+        self.fd_cand.clear();
         let me = Self::parse_me(&obs["self"]);
         let here = (me.pos[0], me.pos[1]);
         let muzzle = [me.pos[0], me.pos[1], me.pos[2] + me.muzzle_h];
@@ -1066,6 +1083,12 @@ impl Bot {
                 let hurt = self.enemies.get(&id).map_or(-100.0, |e| e.hurt_me_t);
                 let hostile = self.enemies.get(&id).map_or(-100.0, |e| e.hostile_until);
                 let facing_since = self.enemies.get(&id).map_or(-1.0, |e| e.facing_since);
+                if let Some(old) = self.enemies.get(&id) {
+                    let hp_now = f(&m["hp"]);
+                    if old.seen >= t - 0.16 && hp_now > 0.0 && old.hp - hp_now >= 40.0 {
+                        self.fd_cand.push((id, old.hp - hp_now));
+                    }
+                }
                 let hit_by_me = self.enemies.get(&id).map_or(false, |e| e.hit_by_me) || self.i_hit.contains(&id);
                 let weapons = m["weapons"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
                 self.enemies.insert(
@@ -1096,6 +1119,7 @@ impl Bot {
                 }
                 if e["type"].as_str() == Some("hit") {
                     if let Some(id) = e["target"].as_i64() {
+                        self.my_hit_t.insert(id, t);
                         if !self.i_hit.contains(&id) {
                             self.i_hit.push(id);
                         }
@@ -1238,6 +1262,24 @@ impl Bot {
             let foreign_death = self.foreign_since >= 0.0 && t - self.foreign_since >= 1.0;
             // House bots never hurt each other and hunt one at a time early, so a badly wounded mech
             // we never touched, or two attackers while we are still only defending, means the same.
+            // Damage we watched another mech take and did not deal. The house squad never hurts
+            // its own, a drone bullet does 25 (37.5 from behind, 50 for two at once) and a mortar
+            // carrier's own blast at most 80, so only two readings count: one hit of 120 or more
+            // (a laser or a mortar shell), or two gun-sized hits (43 to 49.5) inside 10 s.
+            let cands: Vec<(i64, f32)> = self.fd_cand.drain(..).collect();
+            for (id, drop) in cands {
+                let mine = self.my_hit_t.get(&id).map_or(false, |h| t - *h < 0.35);
+                if mine || t >= 60.0 {
+                    continue;
+                }
+                if drop >= 120.0 {
+                    self.fd_big = true;
+                } else if (43.0..=49.5).contains(&drop) {
+                    self.fd_small.push(t);
+                }
+            }
+            self.fd_small.retain(|x| t - *x < 10.0);
+            let foreign_damage = foreign_damage_on() && (self.fd_big || self.fd_small.len() >= 2);
             let wounded_by_others = t < 60.0 && self.enemies.values().any(|e| e.seen >= t - 0.01 && !e.hit_by_me && e.hp < e.max_hp - 350.0);
             let ganged = self.mode == 0 && self.kills == 0 && self.attackers_seen.len() >= 2;
             // The house squad sends one hunter at a time. Shooting heard from two directions well
@@ -1267,7 +1309,7 @@ impl Bot {
             // matches: 5.31 against 5.75). Remember when it was the only reason, and undo it if
             // nobody but us has killed anything by the revert time: 97% of real free-for-alls have
             // a death we did not cause by 20 s.
-            let sure = foreign_death || crossfire || (self.mode == 0 && (wounded_by_others || ganged));
+            let sure = foreign_death || foreign_damage || crossfire || (self.mode == 0 && (wounded_by_others || ganged));
             if self.mode != 2 && crossfire2 && !sure {
                 self.xf_t = t;
             }
