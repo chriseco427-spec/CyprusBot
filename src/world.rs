@@ -203,6 +203,25 @@ impl World {
         true
     }
 
+    /// Mean free distance around a spot at body height: low values are enclosed nooks.
+    pub fn openness(&self, x: f32, y: f32) -> f32 {
+        let z = self.surf_at(x, y) + 5.0;
+        let mut sum = 0.0;
+        for k in 0..16 {
+            let a = k as f32 * std::f32::consts::TAU / 16.0;
+            let (dx, dy) = (a.cos(), a.sin());
+            let mut d = 3.0;
+            while d < 120.0 {
+                if self.surf_at(x + dx * d, y + dy * d) > z {
+                    break;
+                }
+                d += 3.0;
+            }
+            sum += d;
+        }
+        sum / 16.0
+    }
+
     /// Straight walk from a to b stays on free cells with no step larger than a mech can take.
     pub fn walkable_line(&self, a: (f32, f32), b: (f32, f32)) -> bool {
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
