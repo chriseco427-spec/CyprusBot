@@ -81,6 +81,7 @@ struct Enemy {
     weapons: Vec<String>,
     seen: f32,
     hurt_me_t: f32,
+    hostile_until: f32,
 }
 
 impl Enemy {
@@ -149,6 +150,11 @@ pub struct Bot {
     climb_until: f32,
     climb_goal: (f32, f32),
     blacklist: HashMap<i64, f32>,
+    /// 0 = shoot anything, 1 = only mechs that threaten us, 2 = also unaware mechs when safe.
+    policy: u8,
+    tune: [f32; 4],
+    kills: i64,
+    ffa: bool,
 }
 
 impl Bot {
@@ -207,6 +213,18 @@ impl Bot {
             climb_until: -1.0,
             climb_goal: (0.0, 0.0),
             blacklist: HashMap::new(),
+            policy: std::env::var("MB_POLICY").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            kills: 0,
+            ffa: false,
+            tune: {
+                let mut v = [55.0, 0.40, 0.75, 0.0];
+                if let Ok(e) = std::env::var("MB_TUNE") {
+                    for (i, x) in e.split(',').enumerate().take(4) {
+                        v[i] = x.parse().unwrap_or(v[i]);
+                    }
+                }
+                v
+            },
         }
     }
 
@@ -413,6 +431,7 @@ impl Bot {
                     None => continue,
                 };
                 let hurt = self.enemies.get(&id).map_or(-100.0, |e| e.hurt_me_t);
+                let hostile = self.enemies.get(&id).map_or(-100.0, |e| e.hostile_until);
                 let weapons = m["weapons"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
                 self.enemies.insert(
                     id,
@@ -426,12 +445,16 @@ impl Bot {
                         weapons,
                         seen: t,
                         hurt_me_t: hurt,
+                        hostile_until: hostile,
                     },
                 );
             }
         }
         if let Some(evs) = obs["events"].as_array() {
             for e in evs {
+                if e["type"].as_str() == Some("kill") {
+                    self.kills += 1;
+                }
                 if e["type"].as_str() == Some("damaged") {
                     if let Some(by) = e["by"].as_i64() {
                         self.last_hurt_t = t;
@@ -440,6 +463,7 @@ impl Bot {
                         }
                         if let Some(en) = self.enemies.get_mut(&by) {
                             en.hurt_me_t = t;
+                            en.hostile_until = t + 30.0;
                         }
                     }
                 }
@@ -460,7 +484,19 @@ impl Bot {
             ss: zv["shrink_start"].as_f64().unwrap_or(1e6) as f32,
         };
 
+        {
+            let w = &self.w;
+            for e in self.enemies.values_mut() {
+                if e.seen >= t - 0.01 && dxy(&e.pos, &me.pos) < 230.0 {
+                    let facing = wrap(aim_to(e.eye(), my_center)[0] - e.aim[0]).abs() < 0.2;
+                    if facing && w.los(e.eye(), my_center) {
+                        e.hostile_until = e.hostile_until.max(t + 8.0);
+                    }
+                }
+            }
+        }
         let threats: Vec<Enemy> = self.enemies.values().filter(|e| e.seen >= t - 0.01).cloned().collect();
+        let any_hostile = threats.iter().any(|e| e.hostile_until > t);
 
         // ---- target: best enemy we have a line of fire to
         let mut target: Option<Enemy> = None;
@@ -475,7 +511,12 @@ impl Bot {
             if t - e.hurt_me_t < 3.0 || (sees_me && facing && d < 230.0) {
                 attackers += 1;
             }
-            if d < 260.0 && self.w.los(muzzle, e.center()) {
+            let allowed = match self.policy {
+                1 => e.hostile_until > t,
+                2 => e.hostile_until > t || (!any_hostile && hp_frac > 0.9),
+                _ => true,
+            };
+            if allowed && d < 260.0 && self.w.los(muzzle, e.center()) {
                 let score = d + 0.08 * e.hp - if t - e.hurt_me_t < 3.0 { 40.0 } else { 0.0 };
                 if score < best {
                     best = score;
@@ -485,9 +526,16 @@ impl Bot {
         }
         let finishable = target.as_ref().map_or(false, |e| e.hp <= 180.0);
 
-        // ---- retreat hysteresis
-        if !self.retreating {
-            if !threats.is_empty() && !finishable && (hp_frac < 0.40 || (attackers >= 2 && hp_frac < 0.75)) {
+        // ---- retreat hysteresis. Against the house squad nobody else thins the field, so
+        // running only delays the same fight; retreat is for free-for-alls.
+        let alive = obs["alive"].as_i64().unwrap_or(16);
+        if 16 - alive > self.kills {
+            self.ffa = true;
+        }
+        if !self.ffa && self.tune[3] < 0.5 {
+            self.retreating = false;
+        } else if !self.retreating {
+            if !threats.is_empty() && !finishable && (hp_frac < self.tune[1] || (attackers >= 2 && hp_frac < self.tune[2])) {
                 self.retreating = true;
                 self.cover = None;
             }
@@ -547,6 +595,32 @@ impl Bot {
             }
         }
 
+        // Nearest cube we can walk to: worth grabbing even mid-fight (HP, damage, upgrades).
+        let mut near_cube: Option<(f32, (f32, f32))> = None;
+        for (id, it) in &self.cubes {
+            if self.blacklist.get(id).map_or(false, |u| t < *u) {
+                continue;
+            }
+            let d = dxy(&it.pos, &me.pos);
+            if d < 75.0 && in_bounds(&it.pos) && (it.pos[2] - me.pos[2]).abs() < 5.0 && near_cube.map_or(true, |c| d < c.0) {
+                near_cube = Some((d, (it.pos[0], it.pos[1])));
+            }
+        }
+
+        // Nearest weapon worth having while slot 1 is empty.
+        let mut near_gun: Option<(f32, (f32, f32))> = None;
+        if me.wpn[1].is_none() {
+            for (id, it) in &self.pickups {
+                if self.blacklist.get(id).map_or(false, |u| t < *u) || !(it.kind == "laser" || it.kind == "lightning") {
+                    continue;
+                }
+                let d = dxy(&it.pos, &me.pos);
+                if d < 60.0 && in_bounds(&it.pos) && (it.pos[2] - me.pos[2]).abs() < 5.0 && near_gun.map_or(true, |c| d < c.0) {
+                    near_gun = Some((d, (it.pos[0], it.pos[1])));
+                }
+            }
+        }
+
         // ---- movement
         let mut shoot_crate: Option<[f32; 3]> = None;
         let mut goal_id: Option<i64> = None;
@@ -592,12 +666,17 @@ impl Bot {
                     }
                 }
             }
+        } else if let (Some(c), true) = (near_gun, !threats.is_empty() && !self.retreating) {
+            mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
+        } else if let (Some(c), true) = (near_cube, !threats.is_empty() && !self.retreating) {
+            // Fighting or stalking with a cube in reach: collect it while we shoot.
+            mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
         } else if let Some(e) = &target {
             // Fight: strafe around the target at the range our weapons like.
             let to = [e.pos[0] - here.0, e.pos[1] - here.1];
             let d = to[0].hypot(to[1]).max(0.1);
             let dir = [to[0] / d, to[1] / d];
-            let mut range = 55.0;
+            let mut range = self.tune[0];
             if light_s.is_some() && me.energy > 25.0 {
                 range = 30.0;
             } else if e.has("lightning") {
