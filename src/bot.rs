@@ -184,6 +184,10 @@ fn fx(i: usize) -> f32 {
     })[i]
 }
 
+/// Mixed into the seed of our own random choices (strafe reversals, wander points). Zero keeps
+/// the plain seed; other values only reshuffle those choices.
+const RNG_SALT: u64 = 0;
+
 pub struct Bot {
     w: Arc<World>,
     nav: Nav,
@@ -306,7 +310,7 @@ impl Bot {
         Bot {
             w,
             nav,
-            rng: seed.wrapping_mul(0x9E3779B97F4A7C15) | 1,
+            rng: (seed ^ RNG_SALT.wrapping_mul(0xD1B54A32D192ED03)).wrapping_mul(0x9E3779B97F4A7C15) | 1,
             pickup_radius: pr,
             enemies: HashMap::new(),
             pickups: HashMap::new(),
@@ -1492,6 +1496,7 @@ impl Bot {
         }
 
         let weave_ok = matches!(mv, Mv::Goto(..));
+        let flee_hold_now = flee_hold && matches!(mv, Mv::Hold);
         let mut jump = false;
         let (mut mvec, mut boost) = match mv {
             Mv::Goto(g, b) => {
@@ -1694,7 +1699,10 @@ impl Bot {
             aim = aim_to(muzzle, e.center());
             if let Some(s) = laser_s {
                 let w = me.wpn[s].as_ref().unwrap();
-                if !self.retreating && w.cooldown <= 0.1 && dxy(&e.pos, &me.pos) < 150.0 && w.charge < w.full_charge + if fx(0) > 0.5 { fx(1) } else { 1.4 } {
+                // Also when we are hiding and it is walking up on us: meet it with a full charge.
+                let ambush_hold = self.tune[23] > 0.5 && self.retreating && flee_hold_now && dxy(&e.pos, &me.pos) < 80.0;
+                let hold_cap = if ambush_hold { 1.6 } else if fx(0) > 0.5 { fx(1) } else { 1.4 };
+                if (!self.retreating || ambush_hold) && w.cooldown <= 0.1 && dxy(&e.pos, &me.pos) < 150.0 && w.charge < w.full_charge + hold_cap {
                     fire[s] = true;
                 }
             }
