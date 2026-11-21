@@ -185,7 +185,7 @@ fn fx(i: usize) -> f32 {
 }
 
 /// How long a match that looks like practice is still treated as possibly a free-for-all.
-fn p_lite_until() -> f32 {
+pub(crate) fn p_lite_until() -> f32 {
     static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_PLITE").ok().and_then(|v| v.parse().ok()).unwrap_or(16.0))
 }
@@ -283,6 +283,12 @@ fn fetch_on() -> bool {
 fn wounded_hold_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOWOUNDHOLD").is_err())
+}
+
+/// Opening safety (modes 0 and guarded 1): changes practice play, so it ships only on salted builds.
+pub(crate) fn opening_safe_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOOPENSAFE").is_err())
 }
 
 fn scav_on() -> bool {
@@ -1736,6 +1742,13 @@ impl Bot {
             for (id, it) in &self.pickups {
                 let wanted = ((slot_free || (self.tune[12] > 0.5 && gun_s.is_some())) && (it.kind == "laser" || it.kind == "lightning") && slot_of(&it.kind).is_none())
                     || (!slot_free && want_laser && it.kind == "laser" && light_s.is_some());
+                // Opening (match type not known yet, or practice still guarded): no walk to a weapon
+                // across open streets. 10 AM: hit at 6 s on a walk to a weapon 71 m away in the open.
+                let opening = opening_safe_on() && (self.mode == 0 || p_lite);
+                let d_it = dxy(&it.pos, &me.pos);
+                if opening && d_it > 25.0 && self.open_run(here, (it.pos[0], it.pos[1])) > 40.0 {
+                    continue;
+                }
                 if wanted && !danger(&it.pos) && (!cautious || it.pos[2] - me.pos[2] <= 3.0) && in_bounds(&it.pos) && (it.pos[2] - self.w.surf_at(it.pos[0], it.pos[1])).abs() < 2.0 {
                     let pref = if it.kind == "laser" { 0.6 } else { 0.8 };
                     consider(dxy(&it.pos, &me.pos) * pref, &it.pos, *id, &mut goal);

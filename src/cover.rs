@@ -85,7 +85,10 @@ impl Bot {
         // On in confirmed free-for-alls: at 8 AM, 5 of 6 deaths were laser hits at 90 to 190 m with
         // cover 3 to 12 m away and unused; mechs that broke line of sight were hit 8% of the time,
         // against 70 to 89% for those that stayed in it.
-        let brk_on = (ffa_only && fx(10) > 0.5) || (self.mode == 2 && std::env::var("MB_NOBRK").is_err());
+        // Also in the opening, before the match type is known (or while practice is still guarded):
+        // 10 AM, hit first at 10 s from 176 m in the open and dead at 17 s.
+        let opening = super::opening_safe_on() && (self.mode == 0 || (self.mode == 1 && self.kills == 0 && t < super::p_lite_until()));
+        let brk_on = (ffa_only && fx(10) > 0.5) || ((self.mode == 2 || opening) && std::env::var("MB_NOBRK").is_err());
         if brk_on && t < self.brk_until {
             if let Some(e) = self.enemies.get(&self.brk_id).cloned() {
                 if e.hp > 0.5 * me.hp && t - e.seen < 1.0 && self.w.los(e.eye(), my_center) {
