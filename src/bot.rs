@@ -1378,6 +1378,9 @@ impl Bot {
             let out = self.strafe_vec(here, me.pos[2], dir, d, range, t, &z);
             let burst = me.energy > 55.0 && (t * 1.3).sin() > 0.3;
             mv = Mv::Direct(out, burst);
+        } else if let Some(g) = if self.mode == 1 && target.is_none() { self.practice_finish_goal(&me, t) } else { None } {
+            // Practice: follow up a wounded hunter that broke off.
+            mv = Mv::Goto(g, me.energy > 40.0);
         } else if !threats.is_empty() && nearest_threat < 200.0 {
             // Known enemy without a line of fire: chase the weak, otherwise wait for it.
             let e = threats.iter().min_by(|a, b| dxy(&a.pos, &me.pos).partial_cmp(&dxy(&b.pos, &me.pos)).unwrap()).unwrap();
