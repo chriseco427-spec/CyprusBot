@@ -317,6 +317,8 @@ pub struct Bot {
     wander_t: f32,
     last_aim: [f32; 2],
     climb_until: f32,
+    /// Jetting out of a spot we cannot walk out of (free-for-all), and until when.
+    escape_until: f32,
     climb_goal: (f32, f32),
     blacklist: HashMap<i64, f32>,
     policy: u8,
@@ -444,6 +446,7 @@ impl Bot {
             wander_t: -100.0,
             last_aim: [0.0, 0.0],
             climb_until: -1.0,
+            escape_until: -1.0,
             climb_goal: (0.0, 0.0),
             blacklist: HashMap::new(),
             policy: cfg.policy,
@@ -1847,7 +1850,22 @@ impl Bot {
                 let gs = self.w.surf[gc];
                 let dgoal = (g.0 - here.0).hypot(g.1 - here.1);
                 let roof_goal = self.w.prism[gc] && gs > me.pos[2] + 1.5;
-                if at_end && dgoal > 2.5 && me.grounded {
+                // Free-for-all: the zone point, or a point we must reach, cannot be walked to (an
+                // enclosed pocket: 7 AM, 3rd place with full HP burned to death in one). Jet over
+                // the wall toward it, using the climb below.
+                let walled_in = self.mode == 2
+                    && me.grounded
+                    && (zone_urgent || !inside_next)
+                    && dgoal > 8.0
+                    && (at_end || self.path.is_empty())
+                    && t >= self.climb_block_until;
+                if walled_in && t >= self.escape_until {
+                    self.escape_until = t + 6.0;
+                    self.climb_until = t + 6.0;
+                    self.climb_goal = g;
+                }
+                let escaping = t < self.escape_until;
+                if at_end && dgoal > 2.5 && me.grounded && !walled_in {
                     if roof_goal && dgoal < 60.0 && t >= self.climb_block_until {
                         // The goal is on a roof we cannot walk onto: jet up from here.
                         self.climb_until = t + 9.0;
@@ -1856,8 +1874,11 @@ impl Bot {
                         self.blacklist.insert(id, t + 90.0);
                     }
                 }
+                if escaping && (self.climb_goal.0 - g.0).hypot(self.climb_goal.1 - g.1) >= 3.0 {
+                    self.climb_goal = g;
+                }
                 if t < self.climb_until && (self.climb_goal.0 - g.0).hypot(self.climb_goal.1 - g.1) < 3.0 {
-                    if me.grounded && !roof_goal {
+                    if me.grounded && !roof_goal && !escaping {
                         self.climb_until = -1.0;
                     } else {
                         let dir = norm2([g.0 - here.0, g.1 - here.1]);
