@@ -280,6 +280,11 @@ fn fetch_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOFETCH").is_err())
 }
 
+fn wounded_hold_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOWOUNDHOLD").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -1641,10 +1646,10 @@ impl Bot {
         } else if let (Some(c), true) = (practice_rush, !self.retreating) {
             goal_id = Some(c.2);
             mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
-        } else if let (Some(c), true) = (near_gun, !threats.is_empty() && !self.retreating) {
+        } else if let (Some(c), true) = (near_gun, !threats.is_empty() && !self.retreating && !(self.mode == 2 && wounded_hold_on() && hp_frac < 0.6 && near_gun.map_or(false, |c| c.0 > 20.0))) {
             goal_id = Some(c.2);
             mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
-        } else if let (Some(c), true) = (near_cube, !threats.is_empty() && !self.retreating) {
+        } else if let (Some(c), true) = (near_cube, !threats.is_empty() && !self.retreating && !(self.mode == 2 && wounded_hold_on() && hp_frac < 0.6 && near_cube.map_or(false, |c| c.0 > 20.0))) {
             // Fighting or stalking with a cube in reach: collect it while we shoot.
             goal_id = Some(c.2);
             mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
@@ -1680,8 +1685,14 @@ impl Bot {
             let en = &self.enemies;
             let danger = |p: &[f32; 3]| cautious && en.values().any(|e| t - e.seen < 12.0 && dxy(&e.pos, p) < 90.0);
             let calm = !cautious || en.values().all(|e| t - e.seen > 8.0);
+            // Free-for-all, badly hurt: regenerate where we are rather than walk out for loot (9 AM:
+            // killed at 21% HP in the open right after a kill).
+            let lie_low = self.mode == 2 && wounded_hold_on() && hp_frac < 0.6;
             let consider = |score: f32, p: &[f32; 3], id: i64, goal: &mut Option<(f32, (f32, f32), i64)>| {
                 if bl.get(&id).map_or(false, |u| t < *u) {
+                    return;
+                }
+                if lie_low && dxy(p, &me.pos) > 20.0 {
                     return;
                 }
                 if goal.map_or(true, |g| score < g.0) {
@@ -1786,7 +1797,15 @@ impl Bot {
                         let stale = match self.hide {
                             Some(h) => {
                                 let hp3 = [h.0, h.1, 0.0];
-                                let hop = if self.mode == 2 && hide_table_on() { hide_knob(1) } else { self.tune[17] };
+                                // Free-for-all: no hop to a new spot until we have regenerated
+                                // (9 AM: stepped back into view at 56% HP and died in 1.9 s).
+                                let hop = if self.mode == 2 && wounded_hold_on() && hp_frac < 0.9 {
+                                    f32::INFINITY
+                                } else if self.mode == 2 && hide_table_on() {
+                                    hide_knob(1)
+                                } else {
+                                    self.tune[17]
+                                };
                                 !in_bounds(&hp3) || danger(&hp3) || (self.hide_arrived >= 0.0 && t - self.hide_arrived > hop) || t - self.hide_t > 60.0
                             }
                             None => true,
