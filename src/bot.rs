@@ -158,6 +158,23 @@ impl Cfg {
     }
 }
 
+/// Laser and lightning fix knobs. Defaults ship; `FX_TUNE=a,b,...` overrides them in the simulator.
+/// 0: hold guard on (1) / off (0)   1: longest hold past full charge (s)   2: target in our line of
+/// fire this long before release (s)   3: lightning energy reserve (no boost below this)
+/// 4: range (m) of the nearest enemy that triggers the reserve
+fn fx(i: usize) -> f32 {
+    static K: std::sync::OnceLock<[f32; 8]> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let mut k = [1.0, 0.3, 0.3, 30.0, 60.0, 0.0, 0.0, 0.0];
+        if let Ok(e) = std::env::var("FX_TUNE") {
+            for (j, x) in e.split(',').enumerate().take(8) {
+                k[j] = x.parse().unwrap_or(k[j]);
+            }
+        }
+        k
+    })[i]
+}
+
 pub struct Bot {
     w: Arc<World>,
     nav: Nav,
@@ -202,6 +219,10 @@ pub struct Bot {
     /// An ambush we started: see it through unless it goes badly.
     commit_id: i64,
     commit_until: f32,
+    /// The target we have had a continuous line of fire to, since when, and when last.
+    los_id: i64,
+    los_since: f32,
+    los_last: f32,
     /// Places we failed to reach (stuck twice, or a climb that kept failing): keep away for a while.
     avoid: Vec<((f32, f32), f32)>,
     stuck_goal: (f32, f32),
@@ -310,6 +331,9 @@ impl Bot {
             peek_retry_t: -100.0,
             commit_id: -1,
             commit_until: -1.0,
+            los_id: -1,
+            los_since: 0.0,
+            los_last: -100.0,
             avoid: Vec::new(),
             stuck_goal: (0.0, 0.0),
             stuck_goal_t: -100.0,
@@ -896,6 +920,14 @@ impl Bot {
             }
         }
         let finishable = target.as_ref().map_or(false, |e| e.hp <= 180.0);
+        if let Some(e) = &target {
+            // A target only exists with a line of fire, so this times how long we have had it.
+            if e.id != self.los_id || t - self.los_last > 0.25 {
+                self.los_id = e.id;
+                self.los_since = t;
+            }
+            self.los_last = t;
+        }
 
         // ---- stand or run. Against the house squad nobody else thins the field, so running only
         // delays the same fight. In a free-for-all every second alive is worth points: fight one
@@ -1502,12 +1534,18 @@ impl Bot {
             }
         }
         self.avoid.retain(|a| t < a.1);
+        if light_s.is_some() && me.energy < fx(3) && me.in_zone && threats.iter().any(|e| dxy(&e.pos, &me.pos) < fx(4)) {
+            // Lightning needs energy at close range: in recorded close fights, sides that had not
+            // jetted or boosted in the 5 s before won 69%, against 32%.
+            boost = false;
+        }
         if boost && me.energy < 3.0 {
             boost = false;
         }
 
         // ---- aim and fire
         let mut fire = [false, false];
+        let mut laser_release = false;
         let mut aim;
         let mut reload = false;
         if let Some(e) = &target {
@@ -1536,7 +1574,14 @@ impl Bot {
                     if w.charge >= w.full_charge - 0.3 {
                         aim_pt = direct;
                     }
-                    fire[s] = !(ready && on(direct));
+                    // Release at full charge, on target, and only once the target has been in our
+                    // line of fire for a moment: in recorded matches, shots within 0.3 s of the
+                    // target appearing hit 38%, full charges after that 84 to 96%.
+                    let settled = fx(0) < 0.5 || t - self.los_since >= fx(2);
+                    if ready && on(direct) && settled {
+                        laser_release = true;
+                    }
+                    fire[s] = !laser_release;
                 }
             }
             if let Some(s) = gun_s {
@@ -1551,7 +1596,7 @@ impl Bot {
             aim = aim_to(muzzle, e.center());
             if let Some(s) = laser_s {
                 let w = me.wpn[s].as_ref().unwrap();
-                if !self.retreating && w.cooldown <= 0.1 && dxy(&e.pos, &me.pos) < 150.0 && w.charge < w.full_charge + 1.4 {
+                if !self.retreating && w.cooldown <= 0.1 && dxy(&e.pos, &me.pos) < 150.0 && w.charge < w.full_charge + if fx(0) > 0.5 { fx(1) } else { 1.4 } {
                     fire[s] = true;
                 }
             }
@@ -1573,7 +1618,8 @@ impl Bot {
             if let Some(s) = laser_s {
                 let w = me.wpn[s].as_ref().unwrap();
                 if w.cooldown <= 0.1 {
-                    fire[s] = !(w.charge >= w.full_charge - 0.06 && on);
+                    laser_release = w.charge >= w.full_charge - 0.06 && on;
+                    fire[s] = !laser_release;
                 }
             }
             if let Some(s) = light_s {
@@ -1600,7 +1646,8 @@ impl Bot {
                 // One full charge kills a crate: hold until charged and on it, then let go.
                 let w = me.wpn[s].as_ref().unwrap();
                 if w.cooldown <= 0.1 {
-                    fire[s] = !(w.charge >= w.full_charge - 0.06 && on);
+                    laser_release = w.charge >= w.full_charge - 0.06 && on;
+                    fire[s] = !laser_release;
                 }
             }
         } else {
@@ -1616,6 +1663,17 @@ impl Bot {
                 aim = [wrap(base + 1.5 * (t * 1.4).sin()), 0.0];
             } else {
                 aim = [wrap(self.last_aim[0] + 0.33), 0.0];
+            }
+        }
+        // A started charge is let go only on purpose. Any branch that does not hold the trigger
+        // (line of fire lost for a tick, a target switch, no target) would otherwise fire a weak,
+        // unaimed shot: 4 of our 19 laser shots at 12 AM went off at 0.15 to 0.3 s and all missed.
+        // Past full charge plus a short wait we let go anyway, rather than crawl at half speed
+        // until the shot fires on its own.
+        if let Some(s) = laser_s {
+            let w = me.wpn[s].as_ref().unwrap();
+            if fx(0) > 0.5 && w.charge > 0.0 && !fire[s] && !laser_release && w.charge < w.full_charge + fx(1) {
+                fire[s] = true;
             }
         }
         // Lightning: instant arc at anything hostile inside the cone.
