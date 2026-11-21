@@ -184,6 +184,12 @@ fn fx(i: usize) -> f32 {
     })[i]
 }
 
+/// How long a match that looks like practice is still treated as possibly a free-for-all.
+fn p_lite_until() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_PLITE").ok().and_then(|v| v.parse().ok()).unwrap_or(16.0))
+}
+
 /// Mixed into the seed of our own random choices (strafe reversals, wander points). Zero keeps
 /// the plain seed; other values only reshuffle those choices.
 const RNG_SALT: u64 = 0;
@@ -914,6 +920,11 @@ impl Bot {
             }
         }
         let cautious = self.mode != 1;
+        // "Practice" by default is only a guess until someone dies: in recorded free-for-alls the
+        // first death comes at a median of 11 s and after 16 s in one match in eight. Until then,
+        // or until our own first kill, defend ourselves but do not rush weapons, boost around or
+        // pick fights with mechs that are leaving us alone.
+        let p_lite = self.mode == 1 && self.kills == 0 && t < p_lite_until();
         let slot_of = |k: &str| -> Option<usize> { (0..2).find(|&i| me.wpn[i].as_ref().map_or(false, |w| w.kind == k)) };
         let gun_s = slot_of("gun");
         let laser_s = slot_of("laser");
@@ -970,7 +981,7 @@ impl Bot {
                 match self.policy {
                     1 => e.hostile_until > t,
                     2 => e.hostile_until > t || (!any_hostile && hp_frac > 0.9),
-                    _ => true,
+                    _ => !p_lite || e.hostile_until > t,
                 }
             };
             if allowed && d < 260.0 && self.w.los(muzzle, e.center()) {
@@ -1152,7 +1163,7 @@ impl Bot {
                 }
             }
         }
-        let practice_rush = if self.mode == 1 { self.practice_weapon_goal(&me, t, laser_s.is_some(), light_s.is_some(), &in_bounds) } else { None };
+        let practice_rush = if self.mode == 1 && !p_lite { self.practice_weapon_goal(&me, t, laser_s.is_some(), light_s.is_some(), &in_bounds) } else { None };
 
         // A drone worth shooting: one that is hurting us, or any in reach when things are quiet.
         // Each is 350 HP for two cubes, and its own bullets are slow.
@@ -1639,7 +1650,7 @@ impl Bot {
             }
         }
         self.avoid.retain(|a| t < a.1);
-        if self.mode != 1 && t < fx(5) && me.energy < fx(6) && me.in_zone && !self.enemies.values().any(|e| t - e.hurt_me_t < 3.0) {
+        if (self.mode != 1 || p_lite) && t < fx(5) && me.energy < fx(6) && me.in_zone && !self.enemies.values().any(|e| t - e.hurt_me_t < 3.0) {
             // Opening: keep the tank for breaking line of sight. Boost only to escape a mech that
             // is hitting us.
             boost = false;
