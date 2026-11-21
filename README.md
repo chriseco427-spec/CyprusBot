@@ -10,7 +10,10 @@ protocol: JSON lines on stdin and stdout, one action per observation.
 - `src/world.rs`: loads the map (`world.json`, `terrain.i16`) into a 1 m height grid with
   line-of-sight and walkability queries.
 - `src/nav.rs`: A* path search over that grid.
-- `src/bot.rs`: the decision logic.
+- `src/bot.rs`: the decision logic. It tells house-squad practice matches from
+  free-for-alls (mechs dying that it did not kill) and plays the two differently.
+- `src/practice.rs`: behaviour used only in confirmed practice matches.
+- `src/cover.rs`: getting out of a laser's or a lightning carrier's line of fire.
 
 ## Build and check
 
