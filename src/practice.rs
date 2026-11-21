@@ -28,7 +28,7 @@ impl Bot {
     /// A weapon worth running for, as (score, (x, y), pickup id). In practice the hunters come to
     /// us whatever we do, so a laser picked up before the first fight is worth a long detour:
     /// in the simulator, matches where we never hold a laser score about 1.6 points lower.
-    pub(super) fn practice_weapon_goal(&self, me: &Me, t: f32, has_laser: bool, has_light: bool, in_bounds: &dyn Fn(&[f32]) -> bool) -> Option<(f32, (f32, f32), i64)> {
+    pub(super) fn practice_weapon_goal(&self, me: &Me, t: f32, has_laser: bool, has_light: bool, in_bounds: &dyn Fn(&[f32]) -> bool, hunt: bool) -> Option<(f32, (f32, f32), i64)> {
         if knob(0) < 0.5 {
             return None;
         }
@@ -55,7 +55,7 @@ impl Bot {
             }
             // Leave a weapon another mech is closer to. Insurance for a free-for-all mistaken for
             // practice (nobody dead yet at 8 s), where running past armed mechs loses duels.
-            if knob(6) > 0.5 && t < knob(8) && self.enemies.values().any(|e| t - e.seen < 6.0 && dxy(&e.pos, &it.pos) < d + knob(7)) {
+            if !hunt && knob(6) > 0.5 && t < knob(8) && self.enemies.values().any(|e| t - e.seen < 6.0 && dxy(&e.pos, &it.pos) < d + knob(7)) {
                 continue;
             }
             let score = d * pref + if roof { knob(3) } else { 0.0 };
