@@ -9,12 +9,14 @@ use std::sync::OnceLock;
 /// 4: trade lightning for a laser (1) / keep it (0)   5: no enemy closer than this (m) while swapping
 /// 6: skip weapons another mech is nearer to (1) / ignore (0)   7: margin m for that test
 /// 8: only apply that test before this match time (s)   9: highest roof (m above us) worth a climb
+/// 10: distance (m) to keep from hunters while fighting (0 = shared default). House experts hit
+///     41% with the gun at 60-120 m but 17% at 120-200 m; our laser does not care about range.
 pub(super) fn knob(i: usize) -> f32 {
-    static K: OnceLock<[f32; 10]> = OnceLock::new();
+    static K: OnceLock<[f32; 12]> = OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0];
+        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 180.0, 0.0];
         if let Ok(e) = std::env::var("PR_TUNE") {
-            for (j, x) in e.split(',').enumerate().take(10) {
+            for (j, x) in e.split(',').enumerate().take(12) {
                 k[j] = x.parse().unwrap_or(k[j]);
             }
         }

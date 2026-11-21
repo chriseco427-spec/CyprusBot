@@ -1359,6 +1359,9 @@ impl Bot {
             let d = to[0].hypot(to[1]).max(0.1);
             let dir = [to[0] / d, to[1] / d];
             let mut range = self.tune[0];
+            if self.mode == 1 && practice::knob(10) > 0.0 {
+                range = practice::knob(10);
+            }
             if light_s.is_some() && me.energy > 25.0 {
                 range = 30.0;
             } else if e.has("lightning") {
