@@ -444,6 +444,7 @@ pub struct Bot {
     fd_cand: Vec<(i64, f32)>,
     fd_small: Vec<f32>,
     fd_big: bool,
+    fd_logged: bool,
     my_hit_t: HashMap<i64, f32>,
     /// Free-for-all set by the volume rule alone (when), and whether that was undone.
     xf_t: f32,
@@ -590,6 +591,7 @@ impl Bot {
             fd_cand: Vec::new(),
             fd_small: Vec::new(),
             fd_big: false,
+            fd_logged: false,
             my_hit_t: HashMap::new(),
             xf_t: -1.0,
             xf_off: false,
@@ -1279,7 +1281,15 @@ impl Bot {
                 }
             }
             self.fd_small.retain(|x| t - *x < 10.0);
-            let foreign_damage = foreign_damage_on() && (self.fd_big || self.fd_small.len() >= 2);
+            let fd_seen = self.fd_big || self.fd_small.len() >= 2;
+            if fd_seen && !self.fd_logged {
+                self.fd_logged = true;
+                // Test aid for the simulator: count how often the evidence appears at all.
+                if std::env::var("MB_FDLOG").is_ok() {
+                    eprintln!("FDSEEN t={:.1} mode={} kills={} big={}", t, self.mode, self.kills, self.fd_big);
+                }
+            }
+            let foreign_damage = foreign_damage_on() && fd_seen;
             let wounded_by_others = t < 60.0 && self.enemies.values().any(|e| e.seen >= t - 0.01 && !e.hit_by_me && e.hp < e.max_hp - 350.0);
             let ganged = self.mode == 0 && self.kills == 0 && self.attackers_seen.len() >= 2;
             // The house squad sends one hunter at a time. Shooting heard from two directions well
