@@ -8,6 +8,8 @@ use std::f32::consts::{PI, TAU};
 
 #[path = "practice.rs"]
 mod practice;
+#[path = "cover.rs"]
+mod cover;
 
 fn f(v: &Value) -> f32 {
     v.as_f64().unwrap_or(0.0) as f32
@@ -158,6 +160,30 @@ impl Cfg {
     }
 }
 
+/// Laser and lightning fix knobs. Defaults ship; `FX_TUNE=a,b,...` overrides them in the simulator.
+/// 0: hold guard on (1) / off (0)   1: longest hold past full charge (s)   2: target in our line of
+/// fire this long before release (s)   3: lightning energy reserve (no boost below this)
+/// 4: range (m) of the nearest enemy that triggers the reserve   5: opening length (s)
+/// 6: energy floor in the opening (free-for-all and unknown mode)   7: longest open-ground stretch (m)
+/// a weapon rush may cross (0 = no limit)   8: dodge charges aimed at us   10: break away after a
+/// laser hit from range (off: -0.06 in sim)   11: back off from lightning when we hold a laser
+/// (both modes)   12: dodge and break away in practice too
+/// 13: break-away time (s)   14: after a dodge, stay hidden until that charge is spent
+/// 15: no weapon rush outside confirmed practice (1). Every showdown build with the free-for-all
+///     rush (b788b9c on) did badly (5.0 to 5.8 points); the one without it scored 12.2.
+fn fx(i: usize) -> f32 {
+    static K: std::sync::OnceLock<[f32; 16]> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let mut k = [1.0, 0.3, 0.3, 30.0, 60.0, 20.0, 60.0, 40.0, 1.0, 0.0, 0.0, 1.0, 0.0, 3.0, 1.0, 1.0];
+        if let Ok(e) = std::env::var("FX_TUNE") {
+            for (j, x) in e.split(',').enumerate().take(16) {
+                k[j] = x.parse().unwrap_or(k[j]);
+            }
+        }
+        k
+    })[i]
+}
+
 pub struct Bot {
     w: Arc<World>,
     nav: Nav,
@@ -202,6 +228,17 @@ pub struct Bot {
     /// An ambush we started: see it through unless it goes badly.
     commit_id: i64,
     commit_until: f32,
+    /// The target we have had a continuous line of fire to, since when, and when last.
+    los_id: i64,
+    los_since: f32,
+    los_last: f32,
+    /// Break-away from a laser that hit us first at range, and the last lightning that hit us.
+    brk_id: i64,
+    brk_until: f32,
+    zapped_by: i64,
+    zapped_t: f32,
+    dodge_id: i64,
+    dodge_until: f32,
     /// Places we failed to reach (stuck twice, or a climb that kept failing): keep away for a while.
     avoid: Vec<((f32, f32), f32)>,
     stuck_goal: (f32, f32),
@@ -310,6 +347,15 @@ impl Bot {
             peek_retry_t: -100.0,
             commit_id: -1,
             commit_until: -1.0,
+            los_id: -1,
+            los_since: 0.0,
+            los_last: -100.0,
+            brk_id: -1,
+            brk_until: -1.0,
+            zapped_by: -1,
+            zapped_t: -100.0,
+            dodge_id: -1,
+            dodge_until: -1.0,
             avoid: Vec::new(),
             stuck_goal: (0.0, 0.0),
             stuck_goal_t: -100.0,
@@ -607,6 +653,38 @@ impl Bot {
         true
     }
 
+    /// Longest stretch (m) of the straight line a-b with no building within about 8 m.
+    fn open_run(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
+        let w = &self.w;
+        let len = (b.0 - a.0).hypot(b.1 - a.1);
+        let n = (len / 4.0).ceil().max(1.0) as i32;
+        let (mut run, mut best) = (0.0f32, 0.0f32);
+        for k in 0..=n {
+            let f = k as f32 / n as f32;
+            let (x, y) = (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
+            let mut near = false;
+            'probe: for r in [0.0f32, 4.0, 8.0] {
+                for q in 0..8 {
+                    let ang = q as f32 * std::f32::consts::FRAC_PI_4;
+                    if w.prism[w.cell(x + r * ang.cos(), y + r * ang.sin())] {
+                        near = true;
+                        break 'probe;
+                    }
+                    if r == 0.0 {
+                        break;
+                    }
+                }
+            }
+            if near {
+                run = 0.0;
+            } else {
+                run += len / n as f32;
+                best = best.max(run);
+            }
+        }
+        best
+    }
+
     /// Sideways movement around a point at about `range`, reversing unpredictably and never
     /// stopping while any direction is open. `dir` points at the target, `d` is its distance.
     fn strafe_vec(&mut self, here: (f32, f32), z: f32, dir: [f32; 2], d: f32, range: f32, t: f32, zone: &Zone) -> [f32; 2] {
@@ -749,6 +827,17 @@ impl Bot {
                         }
                         if self.enemies.get(&by).map_or(true, |e| e.seen < t - 0.01) {
                             self.ghost_t = t;
+                        }
+                        if e["weapon"].as_str() == Some("lightning") {
+                            self.zapped_by = by;
+                            self.zapped_t = t;
+                        }
+                        if let Some(en) = self.enemies.get(&by) {
+                            let laser = e["weapon"].as_str() == Some("laser") || en.has("laser");
+                            if laser && t >= self.brk_until && dxy(&en.pos, &me.pos) > 60.0 {
+                                self.brk_id = by;
+                                self.brk_until = t + fx(13);
+                            }
                         }
                         if let Some(en) = self.enemies.get_mut(&by) {
                             en.hurt_me_t = t;
@@ -896,6 +985,14 @@ impl Bot {
             }
         }
         let finishable = target.as_ref().map_or(false, |e| e.hp <= 180.0);
+        if let Some(e) = &target {
+            // A target only exists with a line of fire, so this times how long we have had it.
+            if e.id != self.los_id || t - self.los_last > 0.25 {
+                self.los_id = e.id;
+                self.los_since = t;
+            }
+            self.los_last = t;
+        }
 
         // ---- stand or run. Against the house squad nobody else thins the field, so running only
         // delays the same fight. In a free-for-all every second alive is worth points: fight one
@@ -1031,7 +1128,7 @@ impl Bot {
         // practice has a rush of its own: flip PRACTICE_HAS_OWN_RUSH when that lands.
         const PRACTICE_HAS_OWN_RUSH: bool = true;
         let mut ffa_rush: Option<(f32, (f32, f32), i64)> = None;
-        if self.tune[13] < 0.5 && me.wpn[1].is_none() && (self.mode != 1 || !PRACTICE_HAS_OWN_RUSH) {
+        if self.tune[13] < 0.5 && fx(15) < 0.5 && me.wpn[1].is_none() && (self.mode != 1 || !PRACTICE_HAS_OWN_RUSH) {
             for (id, it) in &self.pickups {
                 if self.blacklist.get(id).map_or(false, |u| t < *u) || !(it.kind == "laser" || it.kind == "lightning") {
                     continue;
@@ -1046,6 +1143,10 @@ impl Bot {
                     continue;
                 }
                 if (d > 25.0 || climb > 3.0) && threats.iter().any(|e| e.hostile_until > t && self.w.los(e.eye(), my_center)) {
+                    continue;
+                }
+                // A run across open streets is how we got shot in three of four 1 AM openings.
+                if fx(7) > 0.0 && d > 25.0 && self.open_run(here, (it.pos[0], it.pos[1])) > fx(7) {
                     continue;
                 }
                 let score = d * if it.kind == "laser" { 0.7 } else { 1.0 } + climb * 3.0;
@@ -1193,15 +1294,20 @@ impl Bot {
                 }
             }
         }
+        let cover_mv = self.cover_move(&me, t, &threats, &z, my_center, laser_s.is_some(), light_s.is_some(), &in_bounds);
         if t < self.unstick_until {
             mv = Mv::Direct([self.unstick_dir.cos(), self.unstick_dir.sin()], true);
         } else if zone_urgent {
             mv = Mv::Goto(zone_point, !me.in_zone || z.ss - t < travel + 4.0);
+        } else if let Some(cm) = cover_mv {
+            mv = cm;
         } else if let Some(pm) = peek_mv {
             mv = pm;
         } else if let (Some(r), false) = (ffa_rush, cornered) {
             goal_id = Some(r.2);
-            mv = Mv::Goto(r.1, me.energy > 15.0);
+            // On foot in the opening unless it is right here: boosting from second 1 left us at
+            // 11 to 41 energy and hit in the open at 1 AM.
+            mv = Mv::Goto(r.1, me.energy > 15.0 && (t >= fx(5) || (r.1 .0 - here.0).hypot(r.1 .1 - here.1) < 25.0));
         } else if flee_hold {
             mv = Mv::Hold;
         } else if let Some(c) = flee_goal {
@@ -1502,12 +1608,23 @@ impl Bot {
             }
         }
         self.avoid.retain(|a| t < a.1);
+        if self.mode != 1 && t < fx(5) && me.energy < fx(6) && me.in_zone && !self.enemies.values().any(|e| t - e.hurt_me_t < 3.0) {
+            // Opening: keep the tank for breaking line of sight. Boost only to escape a mech that
+            // is hitting us.
+            boost = false;
+        }
+        if light_s.is_some() && me.energy < fx(3) && me.in_zone && threats.iter().any(|e| dxy(&e.pos, &me.pos) < fx(4)) {
+            // Lightning needs energy at close range: in recorded close fights, sides that had not
+            // jetted or boosted in the 5 s before won 69%, against 32%.
+            boost = false;
+        }
         if boost && me.energy < 3.0 {
             boost = false;
         }
 
         // ---- aim and fire
         let mut fire = [false, false];
+        let mut laser_release = false;
         let mut aim;
         let mut reload = false;
         if let Some(e) = &target {
@@ -1536,7 +1653,14 @@ impl Bot {
                     if w.charge >= w.full_charge - 0.3 {
                         aim_pt = direct;
                     }
-                    fire[s] = !(ready && on(direct));
+                    // Release at full charge, on target, and only once the target has been in our
+                    // line of fire for a moment: in recorded matches, shots within 0.3 s of the
+                    // target appearing hit 38%, full charges after that 84 to 96%.
+                    let settled = fx(0) < 0.5 || t - self.los_since >= fx(2);
+                    if ready && on(direct) && settled {
+                        laser_release = true;
+                    }
+                    fire[s] = !laser_release;
                 }
             }
             if let Some(s) = gun_s {
@@ -1551,7 +1675,7 @@ impl Bot {
             aim = aim_to(muzzle, e.center());
             if let Some(s) = laser_s {
                 let w = me.wpn[s].as_ref().unwrap();
-                if !self.retreating && w.cooldown <= 0.1 && dxy(&e.pos, &me.pos) < 150.0 && w.charge < w.full_charge + 1.4 {
+                if !self.retreating && w.cooldown <= 0.1 && dxy(&e.pos, &me.pos) < 150.0 && w.charge < w.full_charge + if fx(0) > 0.5 { fx(1) } else { 1.4 } {
                     fire[s] = true;
                 }
             }
@@ -1573,7 +1697,8 @@ impl Bot {
             if let Some(s) = laser_s {
                 let w = me.wpn[s].as_ref().unwrap();
                 if w.cooldown <= 0.1 {
-                    fire[s] = !(w.charge >= w.full_charge - 0.06 && on);
+                    laser_release = w.charge >= w.full_charge - 0.06 && on;
+                    fire[s] = !laser_release;
                 }
             }
             if let Some(s) = light_s {
@@ -1600,7 +1725,8 @@ impl Bot {
                 // One full charge kills a crate: hold until charged and on it, then let go.
                 let w = me.wpn[s].as_ref().unwrap();
                 if w.cooldown <= 0.1 {
-                    fire[s] = !(w.charge >= w.full_charge - 0.06 && on);
+                    laser_release = w.charge >= w.full_charge - 0.06 && on;
+                    fire[s] = !laser_release;
                 }
             }
         } else {
@@ -1616,6 +1742,17 @@ impl Bot {
                 aim = [wrap(base + 1.5 * (t * 1.4).sin()), 0.0];
             } else {
                 aim = [wrap(self.last_aim[0] + 0.33), 0.0];
+            }
+        }
+        // A started charge is let go only on purpose. Any branch that does not hold the trigger
+        // (line of fire lost for a tick, a target switch, no target) would otherwise fire a weak,
+        // unaimed shot: 4 of our 19 laser shots at 12 AM went off at 0.15 to 0.3 s and all missed.
+        // Past full charge plus a short wait we let go anyway, rather than crawl at half speed
+        // until the shot fires on its own.
+        if let Some(s) = laser_s {
+            let w = me.wpn[s].as_ref().unwrap();
+            if fx(0) > 0.5 && w.charge > 0.0 && !fire[s] && !laser_release && w.charge < w.full_charge + fx(1) {
+                fire[s] = true;
             }
         }
         // Lightning: instant arc at anything hostile inside the cone.
