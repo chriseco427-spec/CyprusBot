@@ -1394,7 +1394,18 @@ impl Bot {
                 for d in ds {
                     let p = v3(&d["pos"]);
                     let dist = dxy(&p, &me.pos);
-                    if in_bounds(&p) && dist < 300.0 && f(&d["lands_in"]) < dist / me.walk + 10.0 && (!cautious || (calm && dist < 120.0 && !danger(&p))) {
+                    // Free-for-all (confirmed): commit or stay away. In recorded matches the mech
+                    // that took a drop usually went on to win, drops were rarely contested, and
+                    // loitering near one without entering was the dangerous choice. So go only
+                    // when nobody tracked is within 100 m of it, and time the walk to arrive as
+                    // it lands rather than wait in the open.
+                    let ffa_drop = self.mode == 2
+                        && calm
+                        && dist < 200.0
+                        && !en.values().any(|e| t - e.seen < 15.0 && dxy(&e.pos, &p) < 100.0)
+                        && f(&d["lands_in"]) < dist / me.walk + 3.0;
+                    let other_drop = self.mode != 2 && f(&d["lands_in"]) < dist / me.walk + 10.0 && (!cautious || (calm && dist < 120.0 && !danger(&p)));
+                    if in_bounds(&p) && dist < 300.0 && (ffa_drop || other_drop) {
                         consider(dist * 0.4, &p, d["id"].as_i64().unwrap_or(-1), &mut goal);
                     }
                 }
