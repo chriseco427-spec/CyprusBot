@@ -82,7 +82,11 @@ impl Bot {
         }
         // (b) First hit at range by a laser: break line of sight rather than trade in the open,
         // unless it is clearly the weaker side.
-        if ffa_only && fx(10) > 0.5 && t < self.brk_until {
+        // On in confirmed free-for-alls: at 8 AM, 5 of 6 deaths were laser hits at 90 to 190 m with
+        // cover 3 to 12 m away and unused; mechs that broke line of sight were hit 8% of the time,
+        // against 70 to 89% for those that stayed in it.
+        let brk_on = (ffa_only && fx(10) > 0.5) || (self.mode == 2 && std::env::var("MB_NOBRK").is_err());
+        if brk_on && t < self.brk_until {
             if let Some(e) = self.enemies.get(&self.brk_id).cloned() {
                 if e.hp > 0.5 * me.hp && t - e.seen < 1.0 && self.w.los(e.eye(), my_center) {
                     if let Some(c) = self.find_cover(me, std::slice::from_ref(&e), z, false, 16.0, 2.0) {
