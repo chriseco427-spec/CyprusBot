@@ -202,6 +202,14 @@ pub struct Bot {
     /// An ambush we started: see it through unless it goes badly.
     commit_id: i64,
     commit_until: f32,
+    /// Places we failed to reach (stuck twice, or a climb that kept failing): keep away for a while.
+    avoid: Vec<((f32, f32), f32)>,
+    stuck_goal: (f32, f32),
+    stuck_goal_t: f32,
+    stuck_count: u8,
+    climb_tries: u8,
+    climb_try_goal: (f32, f32),
+    climb_block_until: f32,
     /// Drones seen this match: last position and when.
     npc_mem: HashMap<i64, ([f32; 3], f32)>,
     npc_hurt_t: f32,
@@ -302,6 +310,13 @@ impl Bot {
             peek_retry_t: -100.0,
             commit_id: -1,
             commit_until: -1.0,
+            avoid: Vec::new(),
+            stuck_goal: (0.0, 0.0),
+            stuck_goal_t: -100.0,
+            stuck_count: 0,
+            climb_tries: 0,
+            climb_try_goal: (0.0, 0.0),
+            climb_block_until: -1.0,
             npc_mem: HashMap::new(),
             npc_hurt_t: -100.0,
             hist: HashMap::new(),
@@ -423,6 +438,9 @@ impl Bot {
                 if (x - z.c[0]).hypot(y - z.c[1]) > z.r - 6.0 {
                     continue;
                 }
+                if self.avoid.iter().any(|a| (a.0 .0 - x).hypot(a.0 .1 - y) < 8.0) {
+                    continue;
+                }
                 let mut cost = d;
                 let mut near = f32::INFINITY;
                 for e in &threats {
@@ -487,6 +505,9 @@ impl Bot {
                     continue;
                 }
                 if self.npc_mem.values().any(|n| (n.0[0] - x).hypot(n.0[1] - y) < 58.0) {
+                    continue;
+                }
+                if self.avoid.iter().any(|a| t < a.1 && (a.0 .0 - x).hypot(a.0 .1 - y) < 14.0) {
                     continue;
                 }
                 let mut score = w.openness(x, y) + 0.35 * d;
@@ -1017,7 +1038,7 @@ impl Bot {
                 }
                 let d = dxy(&it.pos, &me.pos);
                 let climb = (it.pos[2] - me.pos[2]).max(0.0);
-                if d > 130.0 || climb > 14.0 || !in_bounds(&it.pos) {
+                if d > 130.0 || climb > 3.0 || !in_bounds(&it.pos) {
                     continue;
                 }
                 // Someone else closer to it, or a shooter between us and a long run: leave it.
@@ -1039,7 +1060,12 @@ impl Bot {
         // Each is 350 HP for two cubes, and its own bullets are slow.
         let quiet = threats.is_empty() && (!cautious || self.enemies.values().all(|e| t - e.seen > 8.0));
         let mut shoot_npc: Option<([f32; 3], [f32; 3])> = None;
-        if self.tune[15] < 0.5 && target.is_none() && hp_frac > 0.35 && (t - self.npc_hurt_t < 4.0 || (quiet && hp_frac > 0.6)) {
+        // Their fire is accurate (about three hits in four on a moving mech in real matches), so
+        // one is worth killing for its cubes, but two or more at once, or any while we are hurt or
+        // the opening scramble is on, is a fight to walk away from.
+        let drones_near = npcs.iter().filter(|n| dxy(&n.0, &me.pos) < 62.0).count();
+        let drone_flee = self.tune[15] < 1.5 && !npcs.is_empty() && t - self.npc_hurt_t < 3.0 && (drones_near >= 2 || hp_frac < 0.7 || t < 25.0);
+        if self.tune[15] < 0.5 && !drone_flee && drones_near <= 1 && target.is_none() && hp_frac > 0.75 && quiet && t >= 25.0 {
             let mut bd = 85.0;
             for n in &npcs {
                 let d = d3(muzzle, n.0);
@@ -1212,6 +1238,29 @@ impl Bot {
             } else {
                 mv = Mv::Hold;
             }
+        } else if drone_flee && target.is_none() {
+            // Step out of the drones' reach: straight away from their middle.
+            let (mut sx, mut sy, mut k) = (0.0, 0.0, 0.0);
+            for n in &npcs {
+                if dxy(&n.0, &me.pos) < 70.0 {
+                    sx += n.0[0];
+                    sy += n.0[1];
+                    k += 1.0;
+                }
+            }
+            let away = if k > 0.0 { norm2([here.0 - sx / k, here.1 - sy / k]) } else { [0.0, 0.0] };
+            let mut g = None;
+            for len in [45.0f32, 30.0, 18.0] {
+                let p = [here.0 + away[0] * len, here.1 + away[1] * len];
+                if in_bounds(&p) && self.w.free_at(p[0], p[1]) {
+                    g = Some((p[0], p[1]));
+                    break;
+                }
+            }
+            mv = match g {
+                Some(g) => Mv::Goto(g, me.energy > 30.0),
+                None => Mv::Goto(zone_point, false),
+            };
         } else if let (Some(n), true) = (shoot_npc, threats.is_empty()) {
             // Circle the drone at a distance where its slow bullets miss a moving mech.
             let to = [n.0[0] - here.0, n.0[1] - here.1];
@@ -1252,14 +1301,14 @@ impl Bot {
             for (id, it) in &self.pickups {
                 let wanted = ((slot_free || (self.tune[12] > 0.5 && gun_s.is_some())) && (it.kind == "laser" || it.kind == "lightning") && slot_of(&it.kind).is_none())
                     || (!slot_free && want_laser && it.kind == "laser" && light_s.is_some());
-                if wanted && !danger(&it.pos) && in_bounds(&it.pos) && (it.pos[2] - self.w.surf_at(it.pos[0], it.pos[1])).abs() < 2.0 {
+                if wanted && !danger(&it.pos) && (!cautious || it.pos[2] - me.pos[2] <= 3.0) && in_bounds(&it.pos) && (it.pos[2] - self.w.surf_at(it.pos[0], it.pos[1])).abs() < 2.0 {
                     let pref = if it.kind == "laser" { 0.6 } else { 0.8 };
                     consider(dxy(&it.pos, &me.pos) * pref, &it.pos, *id, &mut goal);
                 }
             }
             if hp_frac > 0.85 && calm && (!cautious || t >= self.tune[18]) {
                 for (id, it) in &self.crates {
-                    if in_bounds(&it.pos) && !danger(&it.pos) {
+                    if in_bounds(&it.pos) && !danger(&it.pos) && (!cautious || it.pos[2] - me.pos[2] <= 3.0) {
                         consider(dxy(&it.pos, &me.pos) * 1.0 + 10.0, &it.pos, *id, &mut goal);
                         let c = [it.pos[0], it.pos[1], it.pos[2] + 1.2];
                         let dd = d3(muzzle, c);
@@ -1348,7 +1397,7 @@ impl Bot {
                 let dgoal = (g.0 - here.0).hypot(g.1 - here.1);
                 let roof_goal = self.w.prism[gc] && gs > me.pos[2] + 1.5;
                 if at_end && dgoal > 2.5 && me.grounded {
-                    if roof_goal && dgoal < 60.0 {
+                    if roof_goal && dgoal < 60.0 && t >= self.climb_block_until {
                         // The goal is on a roof we cannot walk onto: jet up from here.
                         self.climb_until = t + 9.0;
                         self.climb_goal = g;
@@ -1369,14 +1418,24 @@ impl Bot {
                             s += 1.0;
                         }
                         if me.grounded {
-                            let need = (wall_top - me.pos[2] - 2.0).max(0.0) * 1.7 + 8.0;
-                            if need > me.max_energy {
+                            // Rising costs about 1.5 energy a metre; hovering across onto the roof
+                            // costs as much again. Short of that we only fall back down.
+                            let need = (wall_top - me.pos[2]).max(0.0) * 2.2 + 18.0;
+                            if (self.climb_try_goal.0 - g.0).hypot(self.climb_try_goal.1 - g.1) > 6.0 {
+                                self.climb_try_goal = g;
+                                self.climb_tries = 0;
+                            }
+                            if need > me.max_energy || self.climb_tries >= 2 {
+                                // Out of reach, or two jumps did not get us up: stop trying here.
+                                self.climb_block_until = t + 45.0;
+                                self.avoid.push((g, t + 90.0));
                                 self.climb_until = -1.0;
                                 if let Some(id) = goal_id {
                                     self.blacklist.insert(id, t + 300.0);
                                 }
                             } else if me.energy >= need {
                                 jump = true;
+                                self.climb_tries += 1;
                                 out = (dir, false);
                             } else {
                                 out = ([0.0, 0.0], false);
@@ -1400,6 +1459,29 @@ impl Bot {
         } else if t - self.stuck_t >= 1.0 {
             if d3(me.pos, self.stuck_pos) < 0.8 {
                 self.path.clear();
+                let g = match mv {
+                    Mv::Goto(g, _) => g,
+                    _ => here,
+                };
+                if (g.0 - self.stuck_goal.0).hypot(g.1 - self.stuck_goal.1) < 8.0 && t - self.stuck_goal_t < 10.0 {
+                    self.stuck_count += 1;
+                } else {
+                    self.stuck_count = 1;
+                }
+                self.stuck_goal = g;
+                self.stuck_goal_t = t;
+                if self.stuck_count >= 2 {
+                    // The map model says this is reachable and the world disagrees. Drop the goal
+                    // rather than spend the match bouncing off it.
+                    if let Some(id) = goal_id {
+                        self.blacklist.insert(id, t + 90.0);
+                    }
+                    self.avoid.push((g, t + 90.0));
+                    self.hide = None;
+                    self.cover = None;
+                    self.wander = None;
+                    self.stuck_count = 0;
+                }
                 if let (Some(id), false) = (goal_id, threats.is_empty()) {
                     // Blocked on the way to loot with enemies about: forget it, keep fighting.
                     self.blacklist.insert(id, t + 25.0);
@@ -1413,11 +1495,13 @@ impl Bot {
             self.stuck_t = t;
         }
         if t < self.unstick_until {
-            boost = true;
+            // A hop and a sidestep; boosting here only empties the tank against a wall.
+            boost = !me.in_zone;
             if me.grounded {
                 jump = true;
             }
         }
+        self.avoid.retain(|a| t < a.1);
         if boost && me.energy < 3.0 {
             boost = false;
         }
