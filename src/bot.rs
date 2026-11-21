@@ -147,7 +147,7 @@ impl Cfg {
     /// range, retreat hp, retreat hp when outnumbered, retreat in squad mode, hostile bonus,
     /// hp weight, strafe base, strafe spread, power ratio needed to accept a duel when cautious,
     /// seconds before assuming practice, cornered distance, the same duel ratio while the match type is unknown
-    pub const TUNE: [f32; 24] = [55.0, 0.40, 0.75, 0.0, 40.0, 0.08, 0.45, 0.5, 1.3, 8.0, 40.0, 1.3, 0.0, 0.0, 0.0, 0.0, 0.0, 14.0, 0.0, 0.0, 1.0, 0.7, 14.0, 0.0];
+    pub const TUNE: [f32; 24] = [55.0, 0.40, 0.75, 0.0, 40.0, 0.08, 0.45, 0.5, 1.3, 3.0, 40.0, 1.3, 0.0, 0.0, 0.0, 0.0, 0.0, 14.0, 0.0, 0.0, 1.0, 0.7, 14.0, 0.0];
     pub fn from_env() -> Cfg {
         let mut tune = Self::TUNE;
         if let Ok(e) = std::env::var("MB_TUNE") {
