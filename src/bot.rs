@@ -314,6 +314,17 @@ pub(crate) fn finish_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOFINISH").is_err())
 }
 
+/// `MB_XF2=sectors,seconds` (0 sectors = off, the default).
+fn crossfire2() -> (usize, f32) {
+    static K: std::sync::OnceLock<(usize, f32)> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let v: Vec<f32> = std::env::var("MB_XF2").ok().map(|e| e.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+        if v.len() == 2 { (v[0] as usize, v[1]) } else { (XF2_SECTORS, XF2_SECONDS) }
+    })
+}
+const XF2_SECTORS: usize = 0;
+const XF2_SECONDS: f32 = 12.0;
+
 /// Free-for-all: keep 60 m from supply drops we are not taking (`MB_NODROPAWAY=1` turns it off).
 fn drop_away_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -361,6 +372,22 @@ fn open_run_on(w: &World, a: (f32, f32), b: (f32, f32)) -> f32 {
         }
     }
     best
+}
+
+/// First-shot knobs (`MB_FS=a,b,...`): 0 earliest time (s), 1 our HP share, 2 longest range (m),
+/// 3 longest range without a ready laser (m), 4 their power as a multiple of ours, 5 how far off
+/// us the target must be looking (rad).
+fn first_shot_knobs() -> [f32; 6] {
+    static K: std::sync::OnceLock<[f32; 6]> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let mut k = [20.0, 0.75, 220.0, 150.0, 1.3, 1.3];
+        if let Ok(e) = std::env::var("MB_FS") {
+            for (j, x) in e.split(',').enumerate().take(6) {
+                k[j] = x.parse().unwrap_or(k[j]);
+            }
+        }
+        k
+    })
 }
 
 fn scav_on() -> bool {
@@ -1219,7 +1246,21 @@ impl Bot {
                 let centres: Vec<f32> = h.iter().filter(|a| h.iter().filter(|b| wrap(a.0 - b.0).abs() < 0.35).count() >= 3).map(|a| a.0).collect();
                 centres.iter().any(|a| centres.iter().any(|b| wrap(a - b).abs() >= 1.05))
             };
-            if foreign_death || crossfire || (self.mode == 0 && (wounded_by_others || ganged)) {
+            // Stricter form of the same idea, by volume: weapon fire from N or more of eight
+            // compass sectors, three shots each, within the first seconds. Real free-for-alls are
+            // loud at once (median: four sectors inside 8 s); the plain two-direction rule fired in
+            // about half of practice matches (3.98 against 5.75), so this one is off unless a
+            // practice submission shows a setting that never fires there.
+            let (xn, xt) = crossfire2();
+            let crossfire2 = xn > 0 && self.mode != 2 && self.kills == 0 && t <= xt && {
+                let mut bins = [0u8; 8];
+                for h in &self.fire_heard {
+                    let k = (((h.0 + std::f32::consts::PI) / (std::f32::consts::PI / 4.0)) as usize).min(7);
+                    bins[k] = bins[k].saturating_add(1);
+                }
+                bins.iter().filter(|&&c| c >= 3).count() >= xn
+            };
+            if foreign_death || crossfire || crossfire2 || (self.mode == 0 && (wounded_by_others || ganged)) {
                 self.mode = 2;
             } else if self.mode == 0 && t >= self.tune[9] {
                 self.mode = 1;
@@ -1287,22 +1328,23 @@ impl Bot {
                 // the first hit wins three duels in four, and most of the top teams collapse when
                 // hit first. We need to be fresh, and to hold a ready laser or be close enough
                 // for the gun to count.
-                let away = wrap(aim_to(e.eye(), my_center)[0] - e.aim[0]).abs() > 1.3;
                 let busy = e.hp < 0.85 * e.max_hp
                     || threats.iter().any(|o| o.id != e.id && dxy(&o.pos, &e.pos) < 220.0 && wrap(aim_to(e.eye(), o.center())[0] - e.aim[0]).abs() < 0.25);
                 let laser_ready = laser_s.and_then(|sl| me.wpn[sl].as_ref()).map_or(false, |w| w.cooldown <= 0.2);
                 let nobody_on_us = !threats.iter().any(|o| o.id != e.id && o.hostile_until > t);
+                let fs = first_shot_knobs();
+                let away = wrap(aim_to(e.eye(), my_center)[0] - e.aim[0]).abs() > fs[5];
                 let ambush = first_shot_on()
                     && self.mode == 2
-                    && t > 20.0
-                    && hp_frac > 0.85
+                    && t > fs[0]
+                    && hp_frac > fs[1]
                     && d > 55.0
-                    && d < 170.0
-                    && (laser_ready || d < 110.0)
+                    && d < fs[2]
+                    && (laser_ready || d < fs[3])
                     && away
                     && (lonely || busy)
                     && nobody_on_us
-                    && power(e) < 1.15 * my_power;
+                    && power(e) < fs[4] * my_power;
                 if ambush {
                     self.commit_id = e.id;
                     self.commit_until = t + 10.0;
