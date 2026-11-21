@@ -192,7 +192,7 @@ fn p_lite_until() -> f32 {
 
 /// Mixed into the seed of our own random choices (strafe reversals, wander points). Zero keeps
 /// the plain seed; other values only reshuffle those choices.
-const RNG_SALT: u64 = 4;
+const RNG_SALT: u64 = 5;
 
 pub struct Bot {
     w: Arc<World>,
