@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::f32::consts::{PI, TAU};
 
+#[path = "practice.rs"]
+mod practice;
+
 fn f(v: &Value) -> f32 {
     v.as_f64().unwrap_or(0.0) as f32
 }
@@ -932,7 +935,7 @@ impl Bot {
                 if empty.is_some() {
                     take = p["id"].as_i64();
                 } else if let Some(w1) = &me.wpn[1] {
-                    let upgrade = (w1.kind == "mortar") || (self.tune[12] < 0.5 && w1.kind == "lightning" && kind == "laser" && threats.is_empty());
+                    let upgrade = (w1.kind == "mortar") || (self.tune[12] < 0.5 && w1.kind == "lightning" && kind == "laser" && (threats.is_empty() || self.practice_swap_ok(&me, &threats)));
                     if upgrade && w1.charge <= 0.0 {
                         take = p["id"].as_i64();
                         drop = Some(1);
@@ -980,7 +983,7 @@ impl Bot {
         // This rule covers free-for-alls and the opening seconds before the match type is known
         // (when a free-for-all rush matters most). Confirmed practice (mode 1) uses it only until
         // practice has a rush of its own: flip PRACTICE_HAS_OWN_RUSH when that lands.
-        const PRACTICE_HAS_OWN_RUSH: bool = false;
+        const PRACTICE_HAS_OWN_RUSH: bool = true;
         let mut ffa_rush: Option<(f32, (f32, f32), i64)> = None;
         if self.tune[13] < 0.5 && me.wpn[1].is_none() && (self.mode != 1 || !PRACTICE_HAS_OWN_RUSH) {
             for (id, it) in &self.pickups {
@@ -1005,6 +1008,7 @@ impl Bot {
                 }
             }
         }
+        let practice_rush = if self.mode == 1 { self.practice_weapon_goal(&me, t, laser_s.is_some(), light_s.is_some(), &in_bounds) } else { None };
 
         // A drone worth shooting: one that is hurting us, or any in reach when things are quiet.
         // Each is 350 HP for two cubes, and its own bullets are slow.
@@ -1148,6 +1152,9 @@ impl Bot {
             mv = Mv::Hold;
         } else if let Some(c) = flee_goal {
             mv = Mv::Goto(c, me.energy > 12.0);
+        } else if let (Some(c), true) = (practice_rush, !self.retreating) {
+            goal_id = Some(c.2);
+            mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
         } else if let (Some(c), true) = (near_gun, !threats.is_empty() && !self.retreating) {
             goal_id = Some(c.2);
             mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
