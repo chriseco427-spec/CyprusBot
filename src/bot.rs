@@ -1650,7 +1650,8 @@ impl Bot {
             }
         }
         self.avoid.retain(|a| t < a.1);
-        if (self.mode != 1 || p_lite) && t < fx(5) && me.energy < fx(6) && me.in_zone && !self.enemies.values().any(|e| t - e.hurt_me_t < 3.0) {
+        let practice_floor = self.mode == 1 && practice::knob(10) > 0.5 && self.kills < 1;
+        if (((self.mode != 1 || p_lite) && t < fx(5)) || practice_floor) && me.energy < fx(6) && me.in_zone && !self.enemies.values().any(|e| t - e.hurt_me_t < 3.0) {
             // Opening: keep the tank for breaking line of sight. Boost only to escape a mech that
             // is hitting us.
             boost = false;
