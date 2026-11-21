@@ -1086,7 +1086,9 @@ impl Bot {
         }
 
         // ---- zone
-        let margin = (z.nr * 0.5).min(20.0);
+        // In free-for-alls the only zone deaths recorded were full-health hiders caught at the
+        // edge, so keep a wider margin there.
+        let margin = (z.nr * 0.5).min(if self.mode == 2 { 30.0 } else { 20.0 });
         let d_next = dxy(&[here.0, here.1], &z.nc);
         let inside_next = d_next <= z.nr - margin;
         let zone_point = if d_next > 1e-3 {
@@ -1096,7 +1098,7 @@ impl Bot {
             (z.nc[0], z.nc[1])
         };
         let travel = (d_next - (z.nr - margin)).max(0.0) / me.walk;
-        let near_edge = dxy(&[here.0, here.1], &z.c) > z.r - 10.0;
+        let near_edge = dxy(&[here.0, here.1], &z.c) > z.r - if self.mode == 2 { 20.0 } else { 10.0 };
         let zone_urgent = !me.in_zone || (!inside_next && (z.ss - t < travel + 12.0 || near_edge));
         let in_bounds = |p: &[f32]| -> bool {
             dxy(p, &z.c) < z.r - 8.0 && (z.ss - t > 25.0 || dxy(p, &z.nc) < z.nr - 4.0)
