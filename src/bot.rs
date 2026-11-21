@@ -227,7 +227,7 @@ fn crossfire_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Off: in simulated practice it fired on the house squad too and cost about a point, and
     // house bots shoot crates and drones from 3 s on. `MB_XFIRE=1` turns it on for testing.
-    *K.get_or_init(|| std::env::var("MB_XFIRE").is_ok())
+    *K.get_or_init(|| std::env::var("MB_NOXFIRE").is_err())
 }
 
 /// Discovery risk of standing still at ground spots on an 8 m lattice, row by row from the
