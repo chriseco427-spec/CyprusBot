@@ -367,7 +367,7 @@ fn open_run_on(w: &World, a: (f32, f32), b: (f32, f32)) -> f32 {
 fn first_shot_knobs() -> [f32; 6] {
     static K: std::sync::OnceLock<[f32; 6]> = std::sync::OnceLock::new();
     *K.get_or_init(|| {
-        let mut k = [20.0, 0.85, 170.0, 110.0, 1.15, 1.3];
+        let mut k = [20.0, 0.75, 220.0, 150.0, 1.3, 1.3];
         if let Ok(e) = std::env::var("MB_FS") {
             for (j, x) in e.split(',').enumerate().take(6) {
                 k[j] = x.parse().unwrap_or(k[j]);
