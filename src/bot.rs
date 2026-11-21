@@ -398,6 +398,13 @@ fn last4_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOLAST4").is_err())
 }
 
+/// Seconds after which a free-for-all guessed from gunfire volume alone is undone if nobody but
+/// us has killed anything (`MB_XFREVERT`, 0 = never).
+fn xf_revert_s() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_XFREVERT").ok().and_then(|v| v.parse().ok()).unwrap_or(18.0))
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -439,6 +446,9 @@ pub struct Bot {
     escape_until: f32,
     /// Replay marker (look straight up for 0.4 s once, on confirmed free-for-all): when it ran.
     marker_t: f32,
+    /// Free-for-all set by the volume rule alone (when), and whether that was undone.
+    xf_t: f32,
+    xf_off: bool,
     /// Free-for-all: landed or held supply drops we are not taking (keep 60 m away), and the drop
     /// we are walking to, if any.
     drop_avoid: Vec<[f32; 2]>,
@@ -578,6 +588,8 @@ impl Bot {
             climb_until: -1.0,
             escape_until: -1.0,
             marker_t: -1.0,
+            xf_t: -1.0,
+            xf_off: false,
             drop_avoid: Vec::new(),
             drop_goal: -1,
             cover_lim: f32::INFINITY,
@@ -1260,7 +1272,7 @@ impl Bot {
             // about half of practice matches (3.98 against 5.75), so this one is off unless a
             // practice submission shows a setting that never fires there.
             let (xn, xt) = crossfire2();
-            let crossfire2 = xn > 0 && self.mode != 2 && self.kills == 0 && t <= xt && {
+            let crossfire2 = xn > 0 && !self.xf_off && self.mode != 2 && self.kills == 0 && t <= xt && {
                 let mut bins = [0u8; 8];
                 for h in &self.fire_heard {
                     let k = (((h.0 + std::f32::consts::PI) / (std::f32::consts::PI / 4.0)) as usize).min(7);
@@ -1268,7 +1280,23 @@ impl Bot {
                 }
                 bins.iter().filter(|&&c| c >= 3).count() >= xn
             };
-            if foreign_death || crossfire || crossfire2 || (self.mode == 0 && (wounded_by_others || ganged)) {
+            // The volume rule alone is a guess (the house squad set it off in some practice
+            // matches: 5.31 against 5.75). Remember when it was the only reason, and undo it if
+            // nobody but us has killed anything by the revert time: 97% of real free-for-alls have
+            // a death we did not cause by 20 s.
+            let sure = foreign_death || crossfire || (self.mode == 0 && (wounded_by_others || ganged));
+            if self.mode != 2 && crossfire2 && !sure {
+                self.xf_t = t;
+            }
+            if sure {
+                self.xf_t = -1.0;
+            }
+            if self.mode == 2 && self.xf_t >= 0.0 && xf_revert_s() > 0.0 && t >= xf_revert_s() && self.alive0 - alive <= self.kills {
+                self.mode = 1;
+                self.xf_t = -1.0;
+                self.xf_off = true;
+            }
+            if sure || crossfire2 {
                 self.mode = 2;
             } else if self.mode == 0 && t >= self.tune[9] {
                 self.mode = 1;
