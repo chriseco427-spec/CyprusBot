@@ -324,7 +324,7 @@ fn crossfire2() -> (usize, f32) {
         if v.len() == 2 { (v[0] as usize, v[1]) } else { (XF2_SECTORS, XF2_SECONDS) }
     })
 }
-const XF2_SECTORS: usize = 0;
+const XF2_SECTORS: usize = 5;
 const XF2_SECONDS: f32 = 12.0;
 
 /// Free-for-all: keep 60 m from supply drops we are not taking (`MB_NODROPAWAY=1` turns it off).
@@ -400,6 +400,20 @@ fn last4_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOLAST4").is_err())
 }
 
+/// Seconds after which a free-for-all guessed from gunfire volume alone is undone if nobody but
+/// us has killed anything (`MB_XFREVERT`, 0 = never).
+fn xf_revert_s() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_XFREVERT").ok().and_then(|v| v.parse().ok()).unwrap_or(25.0))
+}
+
+/// Free-for-all evidence from damage seen on other mechs (`MB_FD=1` turns it on; off by default
+/// until a practice submission repeats the pick's score exactly).
+fn foreign_damage_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOFD").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -462,6 +476,15 @@ pub struct Bot {
     escape_until: f32,
     /// Replay marker (look straight up for 0.4 s once, on confirmed free-for-all): when it ran.
     marker_t: f32,
+    /// Damage seen on other mechs that we did not deal (free-for-all evidence).
+    fd_cand: Vec<(i64, f32)>,
+    fd_small: Vec<f32>,
+    fd_big: bool,
+    fd_logged: bool,
+    my_hit_t: HashMap<i64, f32>,
+    /// Free-for-all set by the volume rule alone (when), and whether that was undone.
+    xf_t: f32,
+    xf_off: bool,
     /// Free-for-all: landed or held supply drops we are not taking (keep 60 m away), and the drop
     /// we are walking to, if any.
     drop_avoid: Vec<[f32; 2]>,
@@ -606,6 +629,13 @@ impl Bot {
             climb_until: -1.0,
             escape_until: -1.0,
             marker_t: -1.0,
+            fd_cand: Vec::new(),
+            fd_small: Vec::new(),
+            fd_big: false,
+            fd_logged: false,
+            my_hit_t: HashMap::new(),
+            xf_t: -1.0,
+            xf_off: false,
             drop_avoid: Vec::new(),
             drop_goal: -1,
             cover_lim: f32::INFINITY,
@@ -1091,6 +1121,7 @@ impl Bot {
             self.apply_salt(obs);
         }
         let t = f(&obs["t"]);
+        self.fd_cand.clear();
         let me = Self::parse_me(&obs["self"]);
         let here = (me.pos[0], me.pos[1]);
         let muzzle = [me.pos[0], me.pos[1], me.pos[2] + me.muzzle_h];
@@ -1120,6 +1151,12 @@ impl Bot {
                 let hurt = self.enemies.get(&id).map_or(-100.0, |e| e.hurt_me_t);
                 let hostile = self.enemies.get(&id).map_or(-100.0, |e| e.hostile_until);
                 let facing_since = self.enemies.get(&id).map_or(-1.0, |e| e.facing_since);
+                if let Some(old) = self.enemies.get(&id) {
+                    let hp_now = f(&m["hp"]);
+                    if old.seen >= t - 0.16 && hp_now > 0.0 && old.hp - hp_now >= 40.0 {
+                        self.fd_cand.push((id, old.hp - hp_now));
+                    }
+                }
                 let hit_by_me = self.enemies.get(&id).map_or(false, |e| e.hit_by_me) || self.i_hit.contains(&id);
                 let weapons = m["weapons"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
                 self.enemies.insert(
@@ -1150,6 +1187,7 @@ impl Bot {
                 }
                 if e["type"].as_str() == Some("hit") {
                     if let Some(id) = e["target"].as_i64() {
+                        self.my_hit_t.insert(id, t);
                         if !self.i_hit.contains(&id) {
                             self.i_hit.push(id);
                         }
@@ -1292,6 +1330,32 @@ impl Bot {
             let foreign_death = self.foreign_since >= 0.0 && t - self.foreign_since >= 1.0;
             // House bots never hurt each other and hunt one at a time early, so a badly wounded mech
             // we never touched, or two attackers while we are still only defending, means the same.
+            // Damage we watched another mech take and did not deal. The house squad never hurts
+            // its own, a drone bullet does 25 (37.5 from behind, 50 for two at once) and a mortar
+            // carrier's own blast at most 80, so only two readings count: one hit of 120 or more
+            // (a laser or a mortar shell), or two gun-sized hits (43 to 49.5) inside 10 s.
+            let cands: Vec<(i64, f32)> = self.fd_cand.drain(..).collect();
+            for (id, drop) in cands {
+                let mine = self.my_hit_t.get(&id).map_or(false, |h| t - *h < 0.35);
+                if mine || t >= 60.0 {
+                    continue;
+                }
+                if drop >= 120.0 {
+                    self.fd_big = true;
+                } else if (43.0..=49.5).contains(&drop) {
+                    self.fd_small.push(t);
+                }
+            }
+            self.fd_small.retain(|x| t - *x < 10.0);
+            let fd_seen = self.fd_big || self.fd_small.len() >= 2;
+            if fd_seen && !self.fd_logged {
+                self.fd_logged = true;
+                // Test aid for the simulator: count how often the evidence appears at all.
+                if std::env::var("MB_FDLOG").is_ok() {
+                    eprintln!("FDSEEN t={:.1} mode={} kills={} big={}", t, self.mode, self.kills, self.fd_big);
+                }
+            }
+            let foreign_damage = foreign_damage_on() && fd_seen;
             let wounded_by_others = t < 60.0 && self.enemies.values().any(|e| e.seen >= t - 0.01 && !e.hit_by_me && e.hp < e.max_hp - 350.0);
             let ganged = self.mode == 0 && self.kills == 0 && self.attackers_seen.len() >= 2;
             // The house squad sends one hunter at a time. Shooting heard from two directions well
@@ -1309,7 +1373,7 @@ impl Bot {
             // about half of practice matches (3.98 against 5.75), so this one is off unless a
             // practice submission shows a setting that never fires there.
             let (xn, xt) = crossfire2();
-            let crossfire2 = xn > 0 && self.mode != 2 && self.kills == 0 && t <= xt && {
+            let crossfire2 = xn > 0 && !self.xf_off && self.mode != 2 && self.kills == 0 && t <= xt && {
                 let mut bins = [0u8; 8];
                 for h in &self.fire_heard {
                     let k = (((h.0 + std::f32::consts::PI) / (std::f32::consts::PI / 4.0)) as usize).min(7);
@@ -1317,7 +1381,23 @@ impl Bot {
                 }
                 bins.iter().filter(|&&c| c >= 3).count() >= xn
             };
-            if foreign_death || crossfire || crossfire2 || (self.mode == 0 && (wounded_by_others || ganged)) {
+            // The volume rule alone is a guess (the house squad set it off in some practice
+            // matches: 5.31 against 5.75). Remember when it was the only reason, and undo it if
+            // nobody but us has killed anything by the revert time: 97% of real free-for-alls have
+            // a death we did not cause by 20 s.
+            let sure = foreign_death || foreign_damage || crossfire || (self.mode == 0 && (wounded_by_others || ganged));
+            if self.mode != 2 && crossfire2 && !sure {
+                self.xf_t = t;
+            }
+            if sure {
+                self.xf_t = -1.0;
+            }
+            if self.mode == 2 && self.xf_t >= 0.0 && xf_revert_s() > 0.0 && t >= xf_revert_s() && self.alive0 - alive <= self.kills {
+                self.mode = 1;
+                self.xf_t = -1.0;
+                self.xf_off = true;
+            }
+            if sure || crossfire2 {
                 self.mode = 2;
             } else if self.mode == 0 && t >= self.tune[9] {
                 self.mode = 1;
