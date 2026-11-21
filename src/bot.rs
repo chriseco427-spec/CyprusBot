@@ -301,6 +301,18 @@ pub(crate) fn finish_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOFINISH").is_err())
 }
 
+/// Free-for-all: keep 60 m from supply drops we are not taking (`MB_NODROPAWAY=1` turns it off).
+fn drop_away_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NODROPAWAY").is_err())
+}
+
+/// Free-for-all: laser the mortar carrier first (`MB_NOMORTARFIRST=1` turns it off).
+fn mortar_first_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOMORTARFIRST").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -342,6 +354,10 @@ pub struct Bot {
     escape_until: f32,
     /// Replay marker (look straight up for 0.4 s once, on confirmed free-for-all): when it ran.
     marker_t: f32,
+    /// Free-for-all: landed or held supply drops we are not taking (keep 60 m away), and the drop
+    /// we are walking to, if any.
+    drop_avoid: Vec<[f32; 2]>,
+    drop_goal: i64,
     /// When our laser charge reached full (the reported charge stops at full, so how long it has
     /// been held must be timed here), or -1.
     full_since: f32,
@@ -474,6 +490,8 @@ impl Bot {
             climb_until: -1.0,
             escape_until: -1.0,
             marker_t: -1.0,
+            drop_avoid: Vec::new(),
+            drop_goal: -1,
             full_since: -1.0,
             climb_goal: (0.0, 0.0),
             blacklist: HashMap::new(),
@@ -726,6 +744,9 @@ impl Bot {
                 if self.npc_mem.values().any(|n| (n.0[0] - x).hypot(n.0[1] - y) < 58.0) {
                     continue;
                 }
+                if self.drop_avoid.iter().any(|q| (q[0] - x).hypot(q[1] - y) < 60.0) {
+                    continue;
+                }
                 if self.avoid.iter().any(|a| t < a.1 && (a.0 .0 - x).hypot(a.0 .1 - y) < 14.0) {
                     continue;
                 }
@@ -757,6 +778,9 @@ impl Bot {
                     continue;
                 }
                 if self.npc_mem.values().any(|n| (n.0[0] - x).hypot(n.0[1] - y) < 58.0) {
+                    continue;
+                }
+                if self.drop_avoid.iter().any(|q| (q[0] - x).hypot(q[1] - y) < 60.0) {
                     continue;
                 }
                 if self.avoid.iter().any(|a| t < a.1 && (a.0 .0 - x).hypot(a.0 .1 - y) < 14.0) {
@@ -1164,6 +1188,22 @@ impl Bot {
                 self.mode = 1;
             }
         }
+        // Free-for-all: a supply drop that has landed or that someone is capturing is a kill zone
+        // for everyone near it who is not in the ring (ENDGAME.md: 10 of 16 mechs lingering 8-40 m
+        // from one died within 20 s, against 4 of 35 inside the ring). Commit or keep 60 m away.
+        self.drop_avoid.clear();
+        if self.mode == 2 && drop_away_on() {
+            if let Some(ds) = obs["drops"].as_array() {
+                for d in ds {
+                    let id = d["id"].as_i64().unwrap_or(-1);
+                    let live = f(&d["lands_in"]) <= 3.0 || !d["holder"].is_null();
+                    if live && id != self.drop_goal {
+                        let p = v3(&d["pos"]);
+                        self.drop_avoid.push([p[0], p[1]]);
+                    }
+                }
+            }
+        }
         let cautious = self.mode != 1;
         // "Practice" by default is only a guess until someone dies: in recorded free-for-alls the
         // first death comes at a median of 11 s and after 16 s in one match in eight. Until then,
@@ -1231,7 +1271,11 @@ impl Bot {
                 }
             };
             if allowed && d < 260.0 && self.w.los(muzzle, e.center()) {
-                let score = d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 };
+                let mut score = d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 };
+                // Free-for-all: our laser does 60% more to a mortar carrier.
+                if self.mode == 2 && mortar_first_on() && laser_s.is_some() && e.has("mortar") {
+                    score -= 40.0;
+                }
                 if score < best {
                     best = score;
                     target = Some(e.clone());
@@ -1456,6 +1500,9 @@ impl Bot {
                     continue;
                 }
                 if ffa_walk && self.npc_mem.values().any(|n| (n.0[0] - it.pos[0]).hypot(n.0[1] - it.pos[1]) < 50.0) {
+                    continue;
+                }
+                if self.drop_avoid.iter().any(|q| (q[0] - it.pos[0]).hypot(q[1] - it.pos[1]) < 60.0) {
                     continue;
                 }
                 // Someone else closer to it, or a shooter between us and a long run: leave it.
@@ -1719,7 +1766,8 @@ impl Bot {
             let mut goal: Option<(f32, (f32, f32), i64)> = None;
             let bl = &self.blacklist;
             let en = &self.enemies;
-            let danger = |p: &[f32; 3]| cautious && en.values().any(|e| t - e.seen < 12.0 && dxy(&e.pos, p) < 90.0);
+            let da = &self.drop_avoid;
+            let danger = |p: &[f32; 3]| cautious && (en.values().any(|e| t - e.seen < 12.0 && dxy(&e.pos, p) < 90.0) || da.iter().any(|q| (q[0] - p[0]).hypot(q[1] - p[1]) < 60.0));
             let calm = !cautious || en.values().all(|e| t - e.seen > 8.0);
             // Free-for-all, badly hurt: regenerate where we are rather than walk out for loot (9 AM:
             // killed at 21% HP in the open right after a kill).
@@ -1884,7 +1932,7 @@ impl Bot {
                                 let a = self.rand() * TAU;
                                 let r = z.nr * 0.8 * self.rand().sqrt();
                                 let p = (z.nc[0] + r * a.cos(), z.nc[1] + r * a.sin());
-                                if self.w.free_at(p.0, p.1) && !self.w.prism[self.w.cell(p.0, p.1)] {
+                                if self.w.free_at(p.0, p.1) && !self.w.prism[self.w.cell(p.0, p.1)] && !self.drop_avoid.iter().any(|q| (q[0] - p.0).hypot(q[1] - p.1) < 60.0) {
                                     pick = Some(p);
                                     break;
                                 }
@@ -1901,6 +1949,10 @@ impl Bot {
             }
         }
 
+        self.drop_goal = match goal_id {
+            Some(g) if (20000..30000).contains(&g) => g,
+            _ => -1,
+        };
         let weave_ok = matches!(mv, Mv::Goto(..));
         let flee_hold_now = flee_hold && matches!(mv, Mv::Hold);
         let mut jump = false;
