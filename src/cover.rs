@@ -91,7 +91,10 @@ impl Bot {
         let brk_on = (ffa_only && fx(10) > 0.5) || ((self.mode == 2 || opening) && std::env::var("MB_NOBRK").is_err());
         if brk_on && t < self.brk_until {
             if let Some(e) = self.enemies.get(&self.brk_id).cloned() {
-                if e.hp > 0.5 * me.hp && t - e.seen < 1.0 && self.w.los(e.eye(), my_center) {
+                // No break-away from a wounded attacker we can finish (below 40% of its HP while we
+                // are above half of ours): confirmed free-for-all only.
+                let finish = self.mode == 2 && super::finish_on() && e.hp < 0.4 * e.max_hp && me.hp > 0.5 * me.max_hp;
+                if e.hp > 0.5 * me.hp && !finish && t - e.seen < 1.0 && self.w.los(e.eye(), my_center) {
                     // Confirmed free-for-all: look farther for cover, and farther still from a shooter
                     // on a roof, who sees over low walls (two deaths to roof lasers at 175 to 180 m;
                     // one with cover 15 m away, at the edge of the old 16 m search).

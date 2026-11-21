@@ -309,6 +309,11 @@ fn roof_side_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOROOFSIDE").is_err())
 }
 
+pub(crate) fn finish_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOFINISH").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -1340,7 +1345,11 @@ impl Bot {
                         true
                     } else if hostiles.len() == 1 && near <= 1 {
                         let committed = hostiles[0].id == self.commit_id && t < self.commit_until && hp_frac > 0.4;
-                        committed || my_power >= (if self.mode == 0 { self.tune[11] } else { self.tune[8] }) * power(hostiles[0]) || finishable
+                        // A wounded attacker with nobody else on us is worth finishing: pushing on
+                        // one below 40% HP won 71% of recorded fights against 17 to 55% for holding
+                        // or leaving.
+                        let wounded = self.mode == 2 && finish_on() && hostiles[0].hp < 0.4 * hostiles[0].max_hp && hp_frac > 0.5;
+                        committed || wounded || my_power >= (if self.mode == 0 { self.tune[11] } else { self.tune[8] }) * power(hostiles[0]) || finishable
                     } else {
                         false
                     }
