@@ -190,6 +190,11 @@ fn p_lite_until() -> f32 {
     *K.get_or_init(|| std::env::var("MB_PLITE").ok().and_then(|v| v.parse().ok()).unwrap_or(16.0))
 }
 
+fn scav_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
+}
+
 /// Mixed into the seed of our own random choices (strafe reversals, wander points). Zero keeps
 /// the plain seed; other values only reshuffle those choices.
 const RNG_SALT: u64 = 0;
@@ -257,6 +262,9 @@ pub struct Bot {
     climb_tries: u8,
     climb_try_goal: (f32, f32),
     climb_block_until: f32,
+    /// Deaths we heard: estimated place and time. A death leaves cubes and weapons behind.
+    scav: Vec<([f32; 2], f32)>,
+    scav_goal: Option<([f32; 2], f32)>,
     /// Drones seen this match: last position and when.
     npc_mem: HashMap<i64, ([f32; 3], f32)>,
     npc_hurt_t: f32,
@@ -373,6 +381,8 @@ impl Bot {
             climb_tries: 0,
             climb_try_goal: (0.0, 0.0),
             climb_block_until: -1.0,
+            scav: Vec::new(),
+            scav_goal: None,
             npc_mem: HashMap::new(),
             npc_hurt_t: -100.0,
             hist: HashMap::new(),
@@ -864,6 +874,24 @@ impl Bot {
         Self::remember(&mut self.pickups, &obs["pickups"], t);
         Self::remember(&mut self.crates, &obs["crates"], t);
         Self::remember(&mut self.cubes, &obs["cubes"], t);
+        // A death is heard across most of the map, with a bearing and a rough distance.
+        if let Some(ss) = obs["sounds"].as_array() {
+            for snd in ss {
+                if snd["kind"].as_str() != Some("death") {
+                    continue;
+                }
+                let r = match snd["dist"].as_str() {
+                    Some("near") => 35.0,
+                    Some("mid") => 110.0,
+                    _ => continue,
+                };
+                if let Some(b) = snd["bearing"].as_f64() {
+                    let b = b as f32;
+                    self.scav.push(([me.pos[0] + r * b.cos(), me.pos[1] + r * b.sin()], t - f(&snd["age"])));
+                }
+            }
+        }
+        self.scav.retain(|x| t - x.1 < 75.0);
         self.forget(&me, t);
 
         let zv = &obs["zone"];
@@ -1446,6 +1474,36 @@ impl Bot {
                             shoot_crate = Some(c);
                         }
                     }
+                }
+            }
+            // Scavenge (confirmed free-for-all only): a third of all kill drops in recorded
+            // matches were never collected. Once a death site has been quiet for a while and no
+            // mech has been seen near it, go and look; anything there shows up as cubes or weapons
+            // and the rules above take over.
+            if self.mode == 2 && scav_on() && goal.is_none() && calm && hp_frac > 0.7 {
+                if let Some(g) = self.scav_goal {
+                    let p3 = [g.0[0], g.0[1], me.pos[2]];
+                    if t - g.1 > 30.0 || dxy(&p3, &me.pos) < 10.0 || !in_bounds(&p3) || danger(&p3) {
+                        self.scav.retain(|x| (x.0[0] - g.0[0]).hypot(x.0[1] - g.0[1]) > 30.0);
+                        self.scav_goal = None;
+                    }
+                }
+                if self.scav_goal.is_none() {
+                    let mut best: Option<(f32, [f32; 2])> = None;
+                    for x in &self.scav {
+                        let p3 = [x.0[0], x.0[1], me.pos[2]];
+                        let d = dxy(&p3, &me.pos);
+                        if t - x.1 < 15.0 || d < 10.0 || !in_bounds(&p3) || danger(&p3) || !self.w.free_at(x.0[0], x.0[1]) {
+                            continue;
+                        }
+                        if best.map_or(true, |b| d < b.0) {
+                            best = Some((d, x.0));
+                        }
+                    }
+                    self.scav_goal = best.map(|b| (b.1, t));
+                }
+                if let Some(g) = self.scav_goal {
+                    goal = Some((dxy(&[g.0[0], g.0[1], 0.0], &me.pos), (g.0[0], g.0[1]), -2));
                 }
             }
             if let Some(c) = shoot_crate {
