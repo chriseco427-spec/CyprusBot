@@ -8,6 +8,8 @@ use std::f32::consts::{PI, TAU};
 
 #[path = "practice.rs"]
 mod practice;
+#[path = "cover.rs"]
+mod cover;
 
 fn f(v: &Value) -> f32 {
     v.as_f64().unwrap_or(0.0) as f32
@@ -163,13 +165,16 @@ impl Cfg {
 /// fire this long before release (s)   3: lightning energy reserve (no boost below this)
 /// 4: range (m) of the nearest enemy that triggers the reserve   5: opening length (s)
 /// 6: energy floor in the opening (free-for-all and unknown mode)   7: longest open-ground stretch (m)
-/// a weapon rush may cross (0 = no limit)
+/// a weapon rush may cross (0 = no limit)   8: dodge charges aimed at us   10: break away after a
+/// laser hit from range (off: -0.06 in sim)   11: back off from lightning when we hold a laser
+/// (both modes)   12: dodge and break away in practice too
+/// 13: break-away time (s)   14: after a dodge, stay hidden until that charge is spent
 fn fx(i: usize) -> f32 {
-    static K: std::sync::OnceLock<[f32; 8]> = std::sync::OnceLock::new();
+    static K: std::sync::OnceLock<[f32; 16]> = std::sync::OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 0.3, 0.3, 30.0, 60.0, 20.0, 60.0, 40.0];
+        let mut k = [1.0, 0.3, 0.3, 30.0, 60.0, 20.0, 60.0, 40.0, 1.0, 0.0, 0.0, 1.0, 0.0, 3.0, 1.0, 0.0];
         if let Ok(e) = std::env::var("FX_TUNE") {
-            for (j, x) in e.split(',').enumerate().take(8) {
+            for (j, x) in e.split(',').enumerate().take(16) {
                 k[j] = x.parse().unwrap_or(k[j]);
             }
         }
@@ -225,6 +230,13 @@ pub struct Bot {
     los_id: i64,
     los_since: f32,
     los_last: f32,
+    /// Break-away from a laser that hit us first at range, and the last lightning that hit us.
+    brk_id: i64,
+    brk_until: f32,
+    zapped_by: i64,
+    zapped_t: f32,
+    dodge_id: i64,
+    dodge_until: f32,
     /// Places we failed to reach (stuck twice, or a climb that kept failing): keep away for a while.
     avoid: Vec<((f32, f32), f32)>,
     stuck_goal: (f32, f32),
@@ -336,6 +348,12 @@ impl Bot {
             los_id: -1,
             los_since: 0.0,
             los_last: -100.0,
+            brk_id: -1,
+            brk_until: -1.0,
+            zapped_by: -1,
+            zapped_t: -100.0,
+            dodge_id: -1,
+            dodge_until: -1.0,
             avoid: Vec::new(),
             stuck_goal: (0.0, 0.0),
             stuck_goal_t: -100.0,
@@ -808,6 +826,17 @@ impl Bot {
                         if self.enemies.get(&by).map_or(true, |e| e.seen < t - 0.01) {
                             self.ghost_t = t;
                         }
+                        if e["weapon"].as_str() == Some("lightning") {
+                            self.zapped_by = by;
+                            self.zapped_t = t;
+                        }
+                        if let Some(en) = self.enemies.get(&by) {
+                            let laser = e["weapon"].as_str() == Some("laser") || en.has("laser");
+                            if laser && t >= self.brk_until && dxy(&en.pos, &me.pos) > 60.0 {
+                                self.brk_id = by;
+                                self.brk_until = t + fx(13);
+                            }
+                        }
                         if let Some(en) = self.enemies.get_mut(&by) {
                             en.hurt_me_t = t;
                             en.hostile_until = t + 30.0;
@@ -1263,10 +1292,13 @@ impl Bot {
                 }
             }
         }
+        let cover_mv = self.cover_move(&me, t, &threats, &z, my_center, laser_s.is_some(), light_s.is_some(), &in_bounds);
         if t < self.unstick_until {
             mv = Mv::Direct([self.unstick_dir.cos(), self.unstick_dir.sin()], true);
         } else if zone_urgent {
             mv = Mv::Goto(zone_point, !me.in_zone || z.ss - t < travel + 4.0);
+        } else if let Some(cm) = cover_mv {
+            mv = cm;
         } else if let Some(pm) = peek_mv {
             mv = pm;
         } else if let (Some(r), false) = (ffa_rush, cornered) {
