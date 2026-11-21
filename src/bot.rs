@@ -186,7 +186,7 @@ fn fx(i: usize) -> f32 {
 
 /// Mixed into the seed of our own random choices (strafe reversals, wander points). Zero keeps
 /// the plain seed; other values only reshuffle those choices.
-const RNG_SALT: u64 = 1;
+const RNG_SALT: u64 = 2;
 
 pub struct Bot {
     w: Arc<World>,
