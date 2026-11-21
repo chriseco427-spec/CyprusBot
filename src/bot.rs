@@ -10,6 +10,8 @@ use std::f32::consts::{PI, TAU};
 mod practice;
 #[path = "cover.rs"]
 mod cover;
+#[path = "salts.rs"]
+mod salts;
 
 fn f(v: &Value) -> f32 {
     v.as_f64().unwrap_or(0.0) as f32
@@ -369,13 +371,34 @@ fn scav_on() -> bool {
 }
 
 /// Mixed into the seed of our own random choices (strafe reversals, wander points). Zero keeps
-/// the plain seed; other values only reshuffle those choices.
+/// the plain seed; other values only reshuffle those choices. This seeds the stream until the
+/// first observation (no draws happen before it); from then on the match group's entry in
+/// `salts::SALTS` does. Every entry equal to this value plays exactly like the single-salt build.
 const RNG_SALT: u64 = 3;
+
+fn rng_seed(seed: u64, salt: u64) -> u64 {
+    (seed ^ salt.wrapping_mul(0xD1B54A32D192ED03)).wrapping_mul(0x9E3779B97F4A7C15) | 1
+}
+
+/// splitmix64 finaliser: a fixed, version-independent hash step for the match key.
+fn mix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
 
 pub struct Bot {
     w: Arc<World>,
     nav: Nav,
     rng: u64,
+    /// `hello.seed`, `hello.slot`, whether the match group's salt is applied, its group, and how
+    /// many random draws were made (to check that none come before the salt).
+    seed0: u64,
+    slot: i64,
+    salted: bool,
+    salt_group: i32,
+    rng_draws: u32,
     pickup_radius: f32,
     enemies: HashMap<i64, Enemy>,
     pickups: HashMap<i64, Item>,
@@ -516,7 +539,12 @@ impl Bot {
         Bot {
             w,
             nav,
-            rng: (seed ^ RNG_SALT.wrapping_mul(0xD1B54A32D192ED03)).wrapping_mul(0x9E3779B97F4A7C15) | 1,
+            rng: rng_seed(seed, RNG_SALT),
+            seed0: seed,
+            slot: hello["slot"].as_i64().unwrap_or(-1),
+            salted: false,
+            salt_group: -1,
+            rng_draws: 0,
             pickup_radius: pr,
             enemies: HashMap::new(),
             pickups: HashMap::new(),
@@ -599,7 +627,25 @@ impl Bot {
         }
     }
 
+    /// Practice: per-match-group RNG salts. Practice matches are fixed and scored deterministically,
+    /// so each group of matches can get its own salt (`salts::SALTS`, chosen by submission testing).
+    /// The key uses only what the server fixes per match before we act: our slot and the first
+    /// next-circle centre (rounded to 1 m). Runs once, on the first observation, before any draw.
+    fn apply_salt(&mut self, obs: &Value) {
+        self.salted = true;
+        let nc = &obs["zone"]["next_center"];
+        let key = match (nc[0].as_f64(), nc[1].as_f64()) {
+            (Some(x), Some(y)) => mix(mix(mix(self.slot as u64) ^ x.round() as i64 as u64) ^ y.round() as i64 as u64),
+            _ => mix(self.slot as u64),
+        };
+        let g = (key % salts::SALTS.len() as u64) as usize;
+        self.salt_group = g as i32;
+        self.rng = rng_seed(self.seed0, salts::SALTS[g]);
+        eprintln!("salt group {} slot {} next centre {} draws before {}", g, self.slot, nc, self.rng_draws);
+    }
+
     fn rand(&mut self) -> f32 {
+        self.rng_draws = self.rng_draws.wrapping_add(1);
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
@@ -1006,6 +1052,9 @@ impl Bot {
     }
 
     pub fn decide(&mut self, obs: &Value) -> Value {
+        if !self.salted {
+            self.apply_salt(obs);
+        }
         let t = f(&obs["t"]);
         let me = Self::parse_me(&obs["self"]);
         let here = (me.pos[0], me.pos[1]);
