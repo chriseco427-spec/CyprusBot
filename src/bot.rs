@@ -291,6 +291,11 @@ pub(crate) fn opening_safe_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOOPENSAFE").is_err())
 }
 
+fn counter_brk_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOCOUNTERBRK").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -1023,7 +1028,16 @@ impl Bot {
                         }
                         if let Some(en) = self.enemies.get(&by) {
                             let laser = e["weapon"].as_str() == Some("laser") || en.has("laser");
-                            if laser && t >= self.brk_until && dxy(&en.pos, &me.pos) > 60.0 {
+                            // Confirmed free-for-all: also break away from a mech pushing in on us
+                            // with a laser or lightning, and from one carrying 10 or more cubes,
+                            // whatever it hit us with. Recorded first hits: targets that broke line
+                            // of sight from a fast pusher died 27% of the time against 63 to 67%;
+                            // from a 10-cube mech, 36% against 73 to 78%.
+                            let d = dxy(&en.pos, &me.pos);
+                            let toward = (en.vel[0] * (me.pos[0] - en.pos[0]) + en.vel[1] * (me.pos[1] - en.pos[1])) / d.max(1.0);
+                            let pusher = toward >= 3.0 && (en.has("laser") || en.has("lightning")) && d > 45.0 && d < 150.0;
+                            let counter = self.mode == 2 && counter_brk_on() && (pusher || en.cubes >= 10.0);
+                            if ((laser && d > 60.0) || counter) && t >= self.brk_until {
                                 self.brk_id = by;
                                 self.brk_until = t + fx(13);
                             }
