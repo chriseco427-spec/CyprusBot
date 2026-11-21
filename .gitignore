@@ -1,0 +1,10 @@
+# local-only material (kit files, notes, tools)
+CLAUDE.md
+RESULTS.md
+protocol.md
+mechfight-kit.tar.gz
+kit/
+private/
+target/
+.claude/
+.DS_Store
