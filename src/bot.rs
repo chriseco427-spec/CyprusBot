@@ -296,6 +296,19 @@ fn counter_brk_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOCOUNTERBRK").is_err())
 }
 
+/// Free-for-all: no first shot at a snowballer (10+ cubes) that has not hit us (`MB_NOSNOW=1` turns it off).
+fn snow_veto_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOSNOW").is_err())
+}
+
+/// Free-for-all: strict cover also holds when a roof shooter sidesteps along its roof
+/// (`MB_NOROOFSIDE=1` turns it off).
+fn roof_side_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOROOFSIDE").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -658,7 +671,11 @@ impl Bot {
                         for sgn in [-1.0f32, 1.0] {
                             let (px, py) = (e.pos[0] - to[1] * 18.0 * sgn, e.pos[1] + to[0] * 18.0 * sgn);
                             let pc = w.cell(px, py);
-                            if w.prism[pc] {
+                            // Free-for-all: a roof shooter sidesteps along its own roof, so test
+                            // from there at its height (COUNTERS.md #5: cover picked against a
+                            // ground-level eye often fails against a roof sniper).
+                            let same_roof = self.mode == 2 && roof_side_on() && (w.surf[pc] - e.pos[2]).abs() < 2.0;
+                            if w.prism[pc] && !same_roof {
                                 continue;
                             }
                             if w.los([px, py, w.surf[pc] + 8.0], [x, y, s + 0.5 * me.height]) {
@@ -1217,7 +1234,13 @@ impl Bot {
                     self.commit_until = t + 10.0;
                 }
                 let committed = e.id == self.commit_id && t < self.commit_until && hp_frac > 0.4;
-                e.hostile_until > t || prey || ambush || committed || (alive <= 4 && my_power > 1.4 * power(e))
+                // Snowballer (10+ cubes, private/COUNTERS.md #2): one that has only looked our way
+                // is not worth opening on. When we hit one first we die 31-41% of the time and kill
+                // it 21-35%. Shoot back once it hits us, or open when it is aiming at someone else
+                // or is below 40% HP.
+                let busy_other = threats.iter().any(|o| o.id != e.id && dxy(&o.pos, &e.pos) < 220.0 && wrap(aim_to(e.eye(), o.center())[0] - e.aim[0]).abs() < 0.25);
+                let snow_veto = self.mode == 2 && snow_veto_on() && e.cubes >= 10.0 && t - e.hurt_me_t > 30.0 && e.hp >= 0.4 * e.max_hp && !busy_other;
+                (e.hostile_until > t && !snow_veto) || prey || ambush || committed || (alive <= 4 && my_power > 1.4 * power(e))
             } else {
                 match self.policy {
                     1 => e.hostile_until > t,
