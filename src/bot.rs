@@ -342,8 +342,6 @@ pub struct Bot {
     escape_until: f32,
     /// Replay marker (look straight up for 0.4 s once, on confirmed free-for-all): when it ran.
     marker_t: f32,
-    /// Supply drops announced or landed (free-for-all hiding keeps away from them).
-    drop_spots: Vec<[f32; 2]>,
     /// When our laser charge reached full (the reported charge stops at full, so how long it has
     /// been held must be timed here), or -1.
     full_since: f32,
@@ -476,7 +474,6 @@ impl Bot {
             climb_until: -1.0,
             escape_until: -1.0,
             marker_t: -1.0,
-            drop_spots: Vec::new(),
             full_since: -1.0,
             climb_goal: (0.0, 0.0),
             blacklist: HashMap::new(),
@@ -730,11 +727,6 @@ impl Bot {
                     continue;
                 }
                 if self.avoid.iter().any(|a| t < a.1 && (a.0 .0 - x).hypot(a.0 .1 - y) < 14.0) {
-                    continue;
-                }
-                // Not near a supply drop: in recorded matches 10 of 16 mechs that lingered 8 to
-                // 40 m from one without taking it died within 20 s.
-                if self.drop_spots.iter().any(|d| (d[0] - x).hypot(d[1] - y) < 60.0) {
                     continue;
                 }
                 best = Some((score, (x, y)));
@@ -1077,13 +1069,6 @@ impl Bot {
         Self::remember(&mut self.pickups, &obs["pickups"], t);
         Self::remember(&mut self.crates, &obs["crates"], t);
         Self::remember(&mut self.cubes, &obs["cubes"], t);
-        self.drop_spots.clear();
-        if let Some(ds) = obs["drops"].as_array() {
-            for d in ds {
-                let p = v3(&d["pos"]);
-                self.drop_spots.push([p[0], p[1]]);
-            }
-        }
         // A death is heard across most of the map, with a bearing and a rough distance.
         if let Some(ss) = obs["sounds"].as_array() {
             for snd in ss {
@@ -1246,11 +1231,7 @@ impl Bot {
                 }
             };
             if allowed && d < 260.0 && self.w.los(muzzle, e.center()) {
-                let mut score = d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 };
-                if self.mode == 2 && laser_s.is_some() && e.has("mortar") {
-                    // Our laser does 60% more to a mech holding a mortar.
-                    score -= 25.0;
-                }
+                let score = d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 };
                 if score < best {
                     best = score;
                     target = Some(e.clone());
@@ -1868,8 +1849,7 @@ impl Bot {
                                 } else {
                                     self.tune[17]
                                 };
-                                let by_drop = self.mode == 2 && self.drop_spots.iter().any(|d| (d[0] - h.0).hypot(d[1] - h.1) < 60.0);
-                                !in_bounds(&hp3) || danger(&hp3) || by_drop || (self.hide_arrived >= 0.0 && t - self.hide_arrived > hop) || t - self.hide_t > 60.0
+                                !in_bounds(&hp3) || danger(&hp3) || (self.hide_arrived >= 0.0 && t - self.hide_arrived > hop) || t - self.hide_t > 60.0
                             }
                             None => true,
                         };
