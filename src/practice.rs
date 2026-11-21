@@ -9,12 +9,13 @@ use std::sync::OnceLock;
 /// 4: trade lightning for a laser (1) / keep it (0)   5: no enemy closer than this (m) while swapping
 /// 6: skip weapons another mech is nearer to (1) / ignore (0)   7: margin m for that test
 /// 8: only apply that test before this match time (s)   9: highest roof (m above us) worth a climb
+/// 11: offense-first upgrades in practice (1) / shared order (0)
 pub(super) fn knob(i: usize) -> f32 {
-    static K: OnceLock<[f32; 10]> = OnceLock::new();
+    static K: OnceLock<[f32; 12]> = OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0];
+        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 1.0];
         if let Ok(e) = std::env::var("PR_TUNE") {
-            for (j, x) in e.split(',').enumerate().take(10) {
+            for (j, x) in e.split(',').enumerate().take(12) {
                 k[j] = x.parse().unwrap_or(k[j]);
             }
         }
@@ -69,4 +70,24 @@ impl Bot {
     pub(super) fn practice_swap_ok(&self, me: &Me, threats: &[Enemy]) -> bool {
         self.mode == 1 && knob(4) > 0.5 && !threats.iter().any(|e| dxy(&e.pos, &me.pos) < knob(5))
     }
+}
+
+/// Practice upgrade order: points come from kills, so damage first. Laser damage is +18% a
+/// stack on our main killer; laser charge cuts the charge from 0.75 s to 0.56 s. Plating stays
+/// high: max HP still decides how many hunters we outlast. None = use the shared order.
+pub(super) fn upgrade_score(id: &str) -> Option<i32> {
+    if knob(11) < 0.5 {
+        return None;
+    }
+    Some(match id {
+        "laser_damage" => 105,
+        "plating" => 100,
+        "laser_charge" => 97,
+        "armor" => 95,
+        "gun_damage" => 90,
+        "gun_rate" => 88,
+        "lightning_efficiency" => 85,
+        "nanites" => 80,
+        _ => return None,
+    })
 }
