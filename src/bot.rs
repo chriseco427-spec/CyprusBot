@@ -135,18 +135,18 @@ pub struct Cfg {
     pub policy: u8,
     /// range, retreat hp, retreat hp when outnumbered, retreat in squad mode,
     /// hostile bonus, hp weight, strafe base, strafe spread
-    pub tune: [f32; 20],
+    pub tune: [f32; 24],
 }
 
 impl Cfg {
     /// range, retreat hp, retreat hp when outnumbered, retreat in squad mode, hostile bonus,
     /// hp weight, strafe base, strafe spread, power ratio needed to accept a duel when cautious,
     /// seconds before assuming practice, cornered distance, the same duel ratio while the match type is unknown
-    pub const TUNE: [f32; 20] = [55.0, 0.40, 0.75, 0.0, 40.0, 0.08, 0.45, 0.5, 1.3, 8.0, 40.0, 1.3, 0.0, 0.0, 0.0, 0.0, 0.0, 14.0, 0.0, 0.0];
+    pub const TUNE: [f32; 24] = [55.0, 0.40, 0.75, 0.0, 40.0, 0.08, 0.45, 0.5, 1.3, 8.0, 40.0, 1.3, 0.0, 0.0, 0.0, 0.0, 0.0, 14.0, 0.0, 0.0, 1.0, 0.7, 14.0, 0.0];
     pub fn from_env() -> Cfg {
         let mut tune = Self::TUNE;
         if let Ok(e) = std::env::var("MB_TUNE") {
-            for (i, x) in e.split(',').enumerate().take(20) {
+            for (i, x) in e.split(',').enumerate().take(24) {
                 tune[i] = x.parse().unwrap_or(tune[i]);
             }
         }
@@ -186,10 +186,16 @@ pub struct Bot {
     climb_goal: (f32, f32),
     blacklist: HashMap<i64, f32>,
     policy: u8,
-    tune: [f32; 20],
+    tune: [f32; 24],
     kills: i64,
     ghost_t: f32,
     t0: f32,
+    /// Reload cover: until when, where to hide, where we were, and whom we hide from.
+    peek_until: f32,
+    peek_cover: Option<(f32, f32)>,
+    peek_from: (f32, f32),
+    peek_id: i64,
+    peek_retry_t: f32,
     /// Drones seen this match: last position and when.
     npc_mem: HashMap<i64, ([f32; 3], f32)>,
     npc_hurt_t: f32,
@@ -283,6 +289,11 @@ impl Bot {
             kills: 0,
             ghost_t: -100.0,
             t0: -1.0,
+            peek_until: -1.0,
+            peek_cover: None,
+            peek_from: (0.0, 0.0),
+            peek_id: -1,
+            peek_retry_t: -100.0,
             npc_mem: HashMap::new(),
             npc_hurt_t: -100.0,
             hist: HashMap::new(),
@@ -529,48 +540,32 @@ impl Bot {
         ([n[0] * s, n[1] * s], at_end)
     }
 
-    /// How much of the target's velocity to lead by. Plain linear lead is best against most
-    /// movement, but a mech that reverses every half second is closer to where it was than to
-    /// where its velocity points; its own recent track tells us which.
-    fn lead_factor(&self, id: i64, tof: f32, t: f32) -> f32 {
+    /// How much of the target's velocity to lead by. Measured on recorded matches: against mechs
+    /// that are fighting (reversing every half second or so), leading by about 0.8 of the
+    /// velocity hits more often than full lead at every range; a mech walking a steady line
+    /// deserves the full lead.
+    fn lead_factor(&self, id: i64, _tof: f32, t: f32) -> f32 {
         let h = match self.hist.get(&id) {
-            Some(h) if h.len() >= 12 => h,
-            _ => return 1.0,
+            Some(h) if h.len() >= 6 => h,
+            _ => return 0.85,
         };
-        const KS: [f32; 4] = [1.0, 0.7, 0.4, 0.0];
-        let mut hits = [0i32; 4];
-        let mut n = 0;
-        for i in 0..h.len() {
-            let tt = h[i].0 + tof;
-            if tt > t + 0.01 || t - h[i].0 > 2.6 {
+        let now = h[h.len() - 1];
+        let sp = now.2[0].hypot(now.2[1]);
+        for s in h.iter().rev() {
+            let age = t - s.0;
+            if age > 1.3 {
+                break;
+            }
+            if age < 0.25 {
                 continue;
             }
-            let mut j = i;
-            while j + 1 < h.len() && h[j].0 < tt - 0.05 {
-                j += 1;
-            }
-            if (h[j].0 - tt).abs() > 0.12 {
-                continue;
-            }
-            for (q, k) in KS.iter().enumerate() {
-                let px = h[i].1[0] + h[i].2[0] * tof * k;
-                let py = h[i].1[1] + h[i].2[1] * tof * k;
-                if (px - h[j].1[0]).hypot(py - h[j].1[1]) < 2.4 {
-                    hits[q] += 1;
-                }
-            }
-            n += 1;
-        }
-        if n < 8 {
-            return 1.0;
-        }
-        let mut best = 0;
-        for q in 1..4 {
-            if hits[q] > hits[best] + 1 {
-                best = q;
+            let so = s.2[0].hypot(s.2[1]);
+            let dot = now.2[0] * s.2[0] + now.2[1] * s.2[1];
+            if (sp < 3.0) != (so < 3.0) || dot < 0.7 * sp * so {
+                return 0.78;
             }
         }
-        KS[best]
+        1.0
     }
 
     /// Nothing taller than a step within a few metres this way (walls only; drops are fine).
@@ -1031,6 +1026,54 @@ impl Bot {
         let mut goal_id: Option<i64> = None;
         let mv: Mv;
         let cornered = target.as_ref().map_or(false, |e| d3(muzzle, e.center()) < self.tune[10]);
+        // Reload cover: the gun is empty for 2.4 s of every cycle. If a wall is a few steps away,
+        // spend that time behind it and step back out as the magazine fills. Off by default
+        // (tune[20]): in simulation it cost practice points and did nothing in free-for-alls.
+        let mut peek_mv: Option<Mv> = None;
+        if self.tune[20] < 0.5 && !self.retreating && t >= self.unstick_until && !zone_urgent {
+            let gun_reload = gun_s.and_then(|s| me.wpn[s].as_ref()).map_or(0.0, |w| if w.ammo <= 0.0 && w.reload <= 0.0 { 2.4 } else { w.reload });
+            let laser_live = laser_s.and_then(|s| me.wpn[s].as_ref()).map_or(false, |w| w.cooldown < 0.5 || w.charge > 0.0);
+            if let Some(e) = &target {
+                let arc_live = light_s.is_some() && me.energy > 15.0 && d3(muzzle, e.center()) < 43.0;
+                if gun_s.is_some() && gun_reload > self.tune[21] && !laser_live && !arc_live && t >= self.peek_until && t - self.peek_retry_t > 1.0 {
+                    match self.find_cover(&me, std::slice::from_ref(e), &z, false, self.tune[22], 2.0) {
+                        Some(c) => {
+                            self.peek_until = t + gun_reload;
+                            self.peek_cover = Some(c);
+                            self.peek_from = here;
+                            self.peek_id = e.id;
+                        }
+                        None => self.peek_retry_t = t,
+                    }
+                }
+            }
+            if t < self.peek_until {
+                let still_there = threats.iter().any(|e| e.id == self.peek_id);
+                match (self.peek_cover, still_there) {
+                    (Some(c), true) => {
+                        let left = self.peek_until - t;
+                        let back = (c.0 - self.peek_from.0).hypot(c.1 - self.peek_from.1) / me.walk + 0.15;
+                        if left > back {
+                            // Exposed at the hiding spot (the enemy moved): give up on it.
+                            let s = self.w.surf_at(c.0, c.1);
+                            let seen_there = threats.iter().any(|e| e.id == self.peek_id && self.w.los(e.eye(), [c.0, c.1, s + 0.5 * me.height]));
+                            if seen_there {
+                                self.peek_until = -1.0;
+                            } else if (c.0 - here.0).hypot(c.1 - here.1) < 1.2 {
+                                peek_mv = Some(Mv::Hold);
+                            } else {
+                                peek_mv = Some(Mv::Goto(c, me.energy > 20.0));
+                            }
+                        } else if target.is_none() {
+                            peek_mv = Some(Mv::Goto(self.peek_from, false));
+                        } else {
+                            self.peek_until = -1.0;
+                        }
+                    }
+                    _ => self.peek_until = -1.0,
+                }
+            }
+        }
         let mut flee_hold = false;
         let mut flee_goal: Option<(f32, f32)> = None;
         if self.retreating && !cornered && t >= self.unstick_until && !zone_urgent {
@@ -1096,6 +1139,8 @@ impl Bot {
             mv = Mv::Direct([self.unstick_dir.cos(), self.unstick_dir.sin()], true);
         } else if zone_urgent {
             mv = Mv::Goto(zone_point, !me.in_zone || z.ss - t < travel + 4.0);
+        } else if let Some(pm) = peek_mv {
+            mv = pm;
         } else if let (Some(r), false) = (ffa_rush, cornered) {
             goal_id = Some(r.2);
             mv = Mv::Goto(r.1, me.energy > 15.0);
