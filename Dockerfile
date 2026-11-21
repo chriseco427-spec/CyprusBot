@@ -5,7 +5,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-20261104-slim
 COPY --from=build /src/target/release/mechbot /usr/local/bin/mechbot
 USER 65534:65534
 ENTRYPOINT ["/usr/local/bin/mechbot"]
