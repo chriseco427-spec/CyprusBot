@@ -971,8 +971,12 @@ impl Bot {
 
         // Weapon rush: with only the gun, a laser or lightning we can reach before anyone else
         // comes first, ahead of hiding. The teams that win free-for-alls are armed within seconds.
-        let mut rush: Option<(f32, (f32, f32), i64)> = None;
-        if self.tune[13] < 0.5 && me.wpn[1].is_none() {
+        // This rule covers free-for-alls and the opening seconds before the match type is known
+        // (when a free-for-all rush matters most). Confirmed practice (mode 1) uses it only until
+        // practice has a rush of its own: flip PRACTICE_HAS_OWN_RUSH when that lands.
+        const PRACTICE_HAS_OWN_RUSH: bool = false;
+        let mut ffa_rush: Option<(f32, (f32, f32), i64)> = None;
+        if self.tune[13] < 0.5 && me.wpn[1].is_none() && (self.mode != 1 || !PRACTICE_HAS_OWN_RUSH) {
             for (id, it) in &self.pickups {
                 if self.blacklist.get(id).map_or(false, |u| t < *u) || !(it.kind == "laser" || it.kind == "lightning") {
                     continue;
@@ -990,8 +994,8 @@ impl Bot {
                     continue;
                 }
                 let score = d * if it.kind == "laser" { 0.7 } else { 1.0 } + climb * 3.0;
-                if rush.map_or(true, |r| score < r.0) {
-                    rush = Some((score, (it.pos[0], it.pos[1]), *id));
+                if ffa_rush.map_or(true, |r| score < r.0) {
+                    ffa_rush = Some((score, (it.pos[0], it.pos[1]), *id));
                 }
             }
         }
@@ -1081,7 +1085,7 @@ impl Bot {
             mv = Mv::Direct([self.unstick_dir.cos(), self.unstick_dir.sin()], true);
         } else if zone_urgent {
             mv = Mv::Goto(zone_point, !me.in_zone || z.ss - t < travel + 4.0);
-        } else if let (Some(r), false) = (rush, cornered) {
+        } else if let (Some(r), false) = (ffa_rush, cornered) {
             goal_id = Some(r.2);
             mv = Mv::Goto(r.1, me.energy > 15.0);
         } else if flee_hold {
