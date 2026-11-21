@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 pub(super) fn knob(i: usize) -> f32 {
     static K: OnceLock<[f32; 15]> = OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.55, 0.5, 1.0];
+        let mut k = [1.0, 300.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.55, 0.5, 1.0];
         if let Ok(e) = std::env::var("PR_TUNE") {
             for (j, x) in e.split(',').enumerate().take(15) {
                 k[j] = x.parse().unwrap_or(k[j]);
