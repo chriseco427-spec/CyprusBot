@@ -1212,7 +1212,13 @@ impl Bot {
                 }
             };
             if allowed && d < 260.0 && self.w.los(muzzle, e.center()) {
-                let score = d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 };
+                let score = if self.mode == 1 && practice::knob(17) > 0.5 {
+                    // Practice: finish the weakest hunter first, and stay on it.
+                    let current = e.id == self.los_id && t - self.los_last < 1.0;
+                    e.hp + 0.5 * d - if current { practice::knob(18) } else { 0.0 }
+                } else {
+                    d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 }
+                };
                 if score < best {
                     best = score;
                     target = Some(e.clone());
