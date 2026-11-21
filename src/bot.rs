@@ -161,11 +161,13 @@ impl Cfg {
 /// Laser and lightning fix knobs. Defaults ship; `FX_TUNE=a,b,...` overrides them in the simulator.
 /// 0: hold guard on (1) / off (0)   1: longest hold past full charge (s)   2: target in our line of
 /// fire this long before release (s)   3: lightning energy reserve (no boost below this)
-/// 4: range (m) of the nearest enemy that triggers the reserve
+/// 4: range (m) of the nearest enemy that triggers the reserve   5: opening length (s)
+/// 6: energy floor in the opening (free-for-all and unknown mode)   7: longest open-ground stretch (m)
+/// a weapon rush may cross (0 = no limit)
 fn fx(i: usize) -> f32 {
     static K: std::sync::OnceLock<[f32; 8]> = std::sync::OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 0.3, 0.3, 30.0, 60.0, 0.0, 0.0, 0.0];
+        let mut k = [1.0, 0.3, 0.3, 30.0, 60.0, 20.0, 60.0, 40.0];
         if let Ok(e) = std::env::var("FX_TUNE") {
             for (j, x) in e.split(',').enumerate().take(8) {
                 k[j] = x.parse().unwrap_or(k[j]);
@@ -631,6 +633,38 @@ impl Bot {
         true
     }
 
+    /// Longest stretch (m) of the straight line a-b with no building within about 8 m.
+    fn open_run(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
+        let w = &self.w;
+        let len = (b.0 - a.0).hypot(b.1 - a.1);
+        let n = (len / 4.0).ceil().max(1.0) as i32;
+        let (mut run, mut best) = (0.0f32, 0.0f32);
+        for k in 0..=n {
+            let f = k as f32 / n as f32;
+            let (x, y) = (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
+            let mut near = false;
+            'probe: for r in [0.0f32, 4.0, 8.0] {
+                for q in 0..8 {
+                    let ang = q as f32 * std::f32::consts::FRAC_PI_4;
+                    if w.prism[w.cell(x + r * ang.cos(), y + r * ang.sin())] {
+                        near = true;
+                        break 'probe;
+                    }
+                    if r == 0.0 {
+                        break;
+                    }
+                }
+            }
+            if near {
+                run = 0.0;
+            } else {
+                run += len / n as f32;
+                best = best.max(run);
+            }
+        }
+        best
+    }
+
     /// Sideways movement around a point at about `range`, reversing unpredictably and never
     /// stopping while any direction is open. `dir` points at the target, `d` is its distance.
     fn strafe_vec(&mut self, here: (f32, f32), z: f32, dir: [f32; 2], d: f32, range: f32, t: f32, zone: &Zone) -> [f32; 2] {
@@ -1080,6 +1114,10 @@ impl Bot {
                 if (d > 25.0 || climb > 3.0) && threats.iter().any(|e| e.hostile_until > t && self.w.los(e.eye(), my_center)) {
                     continue;
                 }
+                // A run across open streets is how we got shot in three of four 1 AM openings.
+                if fx(7) > 0.0 && d > 25.0 && self.open_run(here, (it.pos[0], it.pos[1])) > fx(7) {
+                    continue;
+                }
                 let score = d * if it.kind == "laser" { 0.7 } else { 1.0 } + climb * 3.0;
                 if ffa_rush.map_or(true, |r| score < r.0) {
                     ffa_rush = Some((score, (it.pos[0], it.pos[1]), *id));
@@ -1233,7 +1271,9 @@ impl Bot {
             mv = pm;
         } else if let (Some(r), false) = (ffa_rush, cornered) {
             goal_id = Some(r.2);
-            mv = Mv::Goto(r.1, me.energy > 15.0);
+            // On foot in the opening unless it is right here: boosting from second 1 left us at
+            // 11 to 41 energy and hit in the open at 1 AM.
+            mv = Mv::Goto(r.1, me.energy > 15.0 && (t >= fx(5) || (r.1 .0 - here.0).hypot(r.1 .1 - here.1) < 25.0));
         } else if flee_hold {
             mv = Mv::Hold;
         } else if let Some(c) = flee_goal {
@@ -1534,6 +1574,11 @@ impl Bot {
             }
         }
         self.avoid.retain(|a| t < a.1);
+        if self.mode != 1 && t < fx(5) && me.energy < fx(6) && me.in_zone && !self.enemies.values().any(|e| t - e.hurt_me_t < 3.0) {
+            // Opening: keep the tank for breaking line of sight. Boost only to escape a mech that
+            // is hitting us.
+            boost = false;
+        }
         if light_s.is_some() && me.energy < fx(3) && me.in_zone && threats.iter().any(|e| dxy(&e.pos, &me.pos) < fx(4)) {
             // Lightning needs energy at close range: in recorded close fights, sides that had not
             // jetted or boosted in the 5 s before won 69%, against 32%.
