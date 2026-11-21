@@ -169,10 +169,12 @@ impl Cfg {
 /// laser hit from range (off: -0.06 in sim)   11: back off from lightning when we hold a laser
 /// (both modes)   12: dodge and break away in practice too
 /// 13: break-away time (s)   14: after a dodge, stay hidden until that charge is spent
+/// 15: no weapon rush outside confirmed practice (1). Every showdown build with the free-for-all
+///     rush (b788b9c on) did badly (5.0 to 5.8 points); the one without it scored 12.2.
 fn fx(i: usize) -> f32 {
     static K: std::sync::OnceLock<[f32; 16]> = std::sync::OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 0.3, 0.3, 30.0, 60.0, 20.0, 60.0, 40.0, 1.0, 0.0, 0.0, 1.0, 0.0, 3.0, 1.0, 0.0];
+        let mut k = [1.0, 0.3, 0.3, 30.0, 60.0, 20.0, 60.0, 40.0, 1.0, 0.0, 0.0, 1.0, 0.0, 3.0, 1.0, 1.0];
         if let Ok(e) = std::env::var("FX_TUNE") {
             for (j, x) in e.split(',').enumerate().take(16) {
                 k[j] = x.parse().unwrap_or(k[j]);
@@ -1126,7 +1128,7 @@ impl Bot {
         // practice has a rush of its own: flip PRACTICE_HAS_OWN_RUSH when that lands.
         const PRACTICE_HAS_OWN_RUSH: bool = true;
         let mut ffa_rush: Option<(f32, (f32, f32), i64)> = None;
-        if self.tune[13] < 0.5 && me.wpn[1].is_none() && (self.mode != 1 || !PRACTICE_HAS_OWN_RUSH) {
+        if self.tune[13] < 0.5 && fx(15) < 0.5 && me.wpn[1].is_none() && (self.mode != 1 || !PRACTICE_HAS_OWN_RUSH) {
             for (id, it) in &self.pickups {
                 if self.blacklist.get(id).map_or(false, |u| t < *u) || !(it.kind == "laser" || it.kind == "lightning") {
                     continue;
