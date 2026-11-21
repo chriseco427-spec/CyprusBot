@@ -265,7 +265,7 @@ fn hide_knob(i: usize) -> f32 {
 fn fetch_knob(i: usize) -> f32 {
     static K: std::sync::OnceLock<[f32; 4]> = std::sync::OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [130.0, 0.0, 10.0, 0.0];
+        let mut k = [130.0, 40.0, 10.0, 0.0];
         if let Ok(e) = std::env::var("MB_FETCH") {
             for (j, x) in e.split(',').enumerate().take(4) {
                 k[j] = x.parse().unwrap_or(k[j]);
@@ -1392,8 +1392,9 @@ impl Bot {
         const PRACTICE_HAS_OWN_RUSH: bool = true;
         let mut ffa_rush: Option<(f32, (f32, f32), i64)> = None;
         // Confirmed free-for-all, gun only, after 10 s: walk (never boost) to a special within
-        // 130 m that no known mech is nearer to. The open-street check is off here: in the
-        // simulator it blocked most fetches (special by 60 s: 57% with it, 66% without). With the rush off we went gun-only all match in 3 of 6 matches at
+        // 130 m that no known mech is nearer to, with at most 40 m of open street on the way.
+        // Without that limit the simulator armed us more often (66% against 55% by 60 s), but
+        // 2 of 6 deaths at 6 AM came on walks to weapons 82 to 86 m away across open ground. With the rush off we went gun-only all match in 3 of 6 matches at
         // 5 AM, and holding a laser for most of a match goes with 9.8 points against 5.2 gun-only.
         let ffa_walk = self.mode == 2 && fetch_on() && fx(15) >= 0.5 && t >= fetch_knob(2) && me.wpn[1].is_none() && hp_frac > 0.5
             // Never within 6 s of being hit: the 1 to 2 AM deaths at 14 s and 17 s were runs across
