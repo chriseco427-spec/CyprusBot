@@ -189,6 +189,9 @@ pub struct Bot {
     tune: [f32; 16],
     kills: i64,
     ghost_t: f32,
+    /// Drones seen this match: last position and when.
+    npc_mem: HashMap<i64, ([f32; 3], f32)>,
+    npc_hurt_t: f32,
     /// Recent (time, position, velocity) per enemy, to judge how predictable its movement is.
     hist: HashMap<i64, Vec<(f32, [f32; 3], [f32; 3])>>,
     foreign_since: f32,
@@ -278,6 +281,8 @@ impl Bot {
             mode: if cfg.mode == 0 { 0 } else { cfg.mode },
             kills: 0,
             ghost_t: -100.0,
+            npc_mem: HashMap::new(),
+            npc_hurt_t: -100.0,
             hist: HashMap::new(),
             foreign_since: -1.0,
             i_hit: Vec::new(),
@@ -460,6 +465,9 @@ impl Bot {
                 if self.enemies.values().any(|e| t - e.seen < 15.0 && (e.pos[0] - x).hypot(e.pos[1] - y) < 80.0) {
                     continue;
                 }
+                if self.npc_mem.values().any(|n| (n.0[0] - x).hypot(n.0[1] - y) < 58.0) {
+                    continue;
+                }
                 let score = w.openness(x, y) + 0.35 * d;
                 if best.map_or(true, |b| score < b.0) {
                     best = Some((score, (x, y)));
@@ -562,6 +570,41 @@ impl Bot {
         true
     }
 
+    /// Sideways movement around a point at about `range`, reversing unpredictably and never
+    /// stopping while any direction is open. `dir` points at the target, `d` is its distance.
+    fn strafe_vec(&mut self, here: (f32, f32), z: f32, dir: [f32; 2], d: f32, range: f32, t: f32, zone: &Zone) -> [f32; 2] {
+        if t >= self.strafe_until {
+            if self.rand() < 0.85 {
+                self.strafe_dir = -self.strafe_dir;
+            }
+            self.strafe_until = t + self.tune[6] + self.tune[7] * self.rand();
+        }
+        let radial = ((d - range) / 20.0).clamp(-1.0, 1.0) * 0.8;
+        let sd = self.strafe_dir;
+        let px = [-dir[1] * sd, dir[0] * sd];
+        let cands = [
+            [px[0] + dir[0] * radial, px[1] + dir[1] * radial],
+            [-px[0] + dir[0] * radial, -px[1] + dir[1] * radial],
+            px,
+            [-px[0], -px[1]],
+            [px[0] - dir[0] * 0.7, px[1] - dir[1] * 0.7],
+            [-px[0] - dir[0] * 0.7, -px[1] - dir[1] * 0.7],
+            [-dir[0], -dir[1]],
+            dir,
+        ];
+        for (k, c) in cands.iter().enumerate() {
+            let v = norm2(*c);
+            let ahead = [here.0 + v[0] * 4.0, here.1 + v[1] * 4.0];
+            if self.open_dir(here, z, v) && dxy(&ahead, &zone.c) < zone.r - 8.0 {
+                if k == 1 || k == 3 || k == 5 {
+                    self.strafe_dir = -sd;
+                }
+                return v;
+            }
+        }
+        [0.0, 0.0]
+    }
+
     fn upgrade_score(id: &str) -> i32 {
         match id {
             "plating" => 100,
@@ -596,8 +639,18 @@ impl Bot {
         let hp_frac = me.hp / me.max_hp;
 
         // ---- memory
+        // Drones in view: (centre, velocity, id).
+        let mut npcs: Vec<([f32; 3], [f32; 3], i64)> = Vec::new();
         if let Some(ms) = obs["mechs"].as_array() {
             for m in ms {
+                if m["kind"].as_str() == Some("npc") {
+                    if let Some(id) = m["id"].as_i64() {
+                        let p = v3(&m["pos"]);
+                        self.npc_mem.insert(id, (p, t));
+                        npcs.push(([p[0], p[1], p[2] + 1.75], v3(&m["vel"]), id));
+                    }
+                    continue;
+                }
                 if m["kind"].as_str() != Some("mech") {
                     continue;
                 }
@@ -646,7 +699,9 @@ impl Bot {
                         }
                     }
                 }
-                if e["type"].as_str() == Some("damaged") {
+                if e["type"].as_str() == Some("damaged") && e["weapon"].as_str() == Some("npc") {
+                    self.npc_hurt_t = t;
+                } else if e["type"].as_str() == Some("damaged") {
                     if let Some(by) = e["by"].as_i64() {
                         if by < 100 && !self.attackers_seen.contains(&by) {
                             self.attackers_seen.push(by);
@@ -765,7 +820,14 @@ impl Bot {
             let allowed = if cautious {
                 // Free-for-all (or not sure yet): shoot back, finish the weak, bully only late.
                 let prey = e.hp < e.max_hp * if alive <= 4 { 0.5 } else { 0.35 } && hp_frac > 0.6 && power(e) < 0.6 * my_power;
-                e.hostile_until > t || prey || (alive <= 4 && my_power > 1.4 * power(e))
+                // A wounded mech looking elsewhere is in someone else's fight: the cheapest cubes.
+                let busy = self.tune[14] > 0.0
+                    && e.hp < e.max_hp * self.tune[14]
+                    && hp_frac > 0.8
+                    && d < 120.0
+                    && power(e) < 0.9 * my_power
+                    && wrap(aim_to(e.eye(), my_center)[0] - e.aim[0]).abs() > 1.2;
+                e.hostile_until > t || prey || busy || (alive <= 4 && my_power > 1.4 * power(e))
             } else {
                 match self.policy {
                     1 => e.hostile_until > t,
@@ -913,6 +975,21 @@ impl Bot {
             }
         }
 
+        // A drone worth shooting: one that is hurting us, or any in reach when things are quiet.
+        // Each is 350 HP for two cubes, and its own bullets are slow.
+        let quiet = threats.is_empty() && (!cautious || self.enemies.values().all(|e| t - e.seen > 8.0));
+        let mut shoot_npc: Option<([f32; 3], [f32; 3])> = None;
+        if self.tune[15] < 0.5 && target.is_none() && hp_frac > 0.35 && (t - self.npc_hurt_t < 4.0 || (quiet && hp_frac > 0.6)) {
+            let mut bd = 85.0;
+            for n in &npcs {
+                let d = d3(muzzle, n.0);
+                if d < bd && self.w.los(muzzle, n.0) {
+                    bd = d;
+                    shoot_npc = Some((n.0, n.1));
+                }
+            }
+        }
+
         // ---- movement
         let mut shoot_crate: Option<[f32; 3]> = None;
         let mut goal_id: Option<i64> = None;
@@ -1005,37 +1082,7 @@ impl Bot {
             } else if e.has("lightning") {
                 range = 65.0;
             }
-            if t >= self.strafe_until {
-                if self.rand() < 0.85 {
-                    self.strafe_dir = -self.strafe_dir;
-                }
-                self.strafe_until = t + self.tune[6] + self.tune[7] * self.rand();
-            }
-            let radial = ((d - range) / 20.0).clamp(-1.0, 1.0) * 0.8;
-            let sd = self.strafe_dir;
-            let px = [-dir[1] * sd, dir[0] * sd];
-            // Preferred strafe first, then anything else that is open: standing still loses duels.
-            let cands = [
-                [px[0] + dir[0] * radial, px[1] + dir[1] * radial],
-                [-px[0] + dir[0] * radial, -px[1] + dir[1] * radial],
-                px,
-                [-px[0], -px[1]],
-                [px[0] - dir[0] * 0.7, px[1] - dir[1] * 0.7],
-                [-px[0] - dir[0] * 0.7, -px[1] - dir[1] * 0.7],
-                [-dir[0], -dir[1]],
-                dir,
-            ];
-            let mut out = [0.0, 0.0];
-            for (k, c) in cands.iter().enumerate() {
-                let v = norm2(*c);
-                if self.open_dir(here, me.pos[2], v) && in_bounds(&[here.0 + v[0] * 4.0, here.1 + v[1] * 4.0]) {
-                    out = v;
-                    if k == 1 || k == 3 || k == 5 {
-                        self.strafe_dir = -sd;
-                    }
-                    break;
-                }
-            }
+            let out = self.strafe_vec(here, me.pos[2], dir, d, range, t, &z);
             let burst = me.energy > 55.0 && (t * 1.3).sin() > 0.3;
             mv = Mv::Direct(out, burst);
         } else if !threats.is_empty() && nearest_threat < 200.0 {
@@ -1046,6 +1093,12 @@ impl Bot {
             } else {
                 mv = Mv::Hold;
             }
+        } else if let (Some(n), true) = (shoot_npc, threats.is_empty()) {
+            // Circle the drone at a distance where its slow bullets miss a moving mech.
+            let to = [n.0[0] - here.0, n.0[1] - here.1];
+            let d = to[0].hypot(to[1]).max(0.1);
+            let out = self.strafe_vec(here, me.pos[2], [to[0] / d, to[1] / d], d, 60.0, t, &z);
+            mv = Mv::Direct(out, false);
         } else {
             // Idle: supply drop, cubes, weapons, crates, then explore inside the next circle.
             let mut goal: Option<(f32, (f32, f32), i64)> = None;
@@ -1301,6 +1354,31 @@ impl Bot {
             }
         } else if t - self.last_hurt_t < 2.5 {
             aim = [self.hurt_bearing, 0.0];
+        } else if let Some((c0, v)) = shoot_npc {
+            let speed = gun_s.and_then(|s| me.wpn[s].as_ref()).map_or(252.0, |w| w.speed);
+            let tt = d3(muzzle, c0) / speed + 0.05;
+            let p = [c0[0] + v[0] * tt, c0[1] + v[1] * tt, c0[2]];
+            aim = aim_to(muzzle, p);
+            let dd = dxy(&p, &muzzle).max(1.0);
+            let on = wrap(aim[0] - me.aim[0]).abs() * dd < 1.4 && (aim[1] - me.aim[1]).abs() * dd < 1.3;
+            if let Some(s) = gun_s {
+                let w = me.wpn[s].as_ref().unwrap();
+                if on && w.ammo > 0.0 && w.reload <= 0.0 && d3(muzzle, c0) < w.range - 3.0 {
+                    fire[s] = true;
+                }
+            }
+            if let Some(s) = laser_s {
+                let w = me.wpn[s].as_ref().unwrap();
+                if w.cooldown <= 0.1 {
+                    fire[s] = !(w.charge >= w.full_charge - 0.06 && on);
+                }
+            }
+            if let Some(s) = light_s {
+                let w = me.wpn[s].as_ref().unwrap();
+                if d3(muzzle, c0) < w.range - 3.0 && wrap(aim[0] - me.aim[0]).abs() < 0.2 && me.energy > 30.0 {
+                    fire[s] = true;
+                }
+            }
         } else if let Some(c) = shoot_crate {
             aim = aim_to(muzzle, c);
             let dd = dxy(&c, &muzzle).max(1.0);
