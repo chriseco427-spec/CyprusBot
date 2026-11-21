@@ -199,6 +199,9 @@ pub struct Bot {
     peek_from: (f32, f32),
     peek_id: i64,
     peek_retry_t: f32,
+    /// An ambush we started: see it through unless it goes badly.
+    commit_id: i64,
+    commit_until: f32,
     /// Drones seen this match: last position and when.
     npc_mem: HashMap<i64, ([f32; 3], f32)>,
     npc_hurt_t: f32,
@@ -297,6 +300,8 @@ impl Bot {
             peek_from: (0.0, 0.0),
             peek_id: -1,
             peek_retry_t: -100.0,
+            commit_id: -1,
+            commit_until: -1.0,
             npc_mem: HashMap::new(),
             npc_hurt_t: -100.0,
             hist: HashMap::new(),
@@ -834,7 +839,26 @@ impl Bot {
                     && d < 120.0
                     && power(e) < 0.9 * my_power
                     && wrap(aim_to(e.eye(), my_center)[0] - e.aim[0]).abs() > 1.2;
-                e.hostile_until > t || prey || busy || (alive <= 4 && my_power > 1.4 * power(e))
+                // Ambush: a mech that cannot see us (we are outside its view wedge and its 45 m
+                // sensors), with nobody else around, when we are fresh. First shots land on its
+                // back, and in recorded matches whoever shoots first wins three duels in four.
+                let lonely = threats.len() == 1 && self.enemies.values().filter(|o| t - o.seen < 8.0).count() == 1;
+                let ambush = self.tune[23] > 0.5
+                    && self.mode == 2
+                    && t > 20.0
+                    && hp_frac > 0.9
+                    && d > 50.0
+                    && d < 115.0
+                    && lonely
+                    && power(e) < 1.1 * my_power
+                    && (self.tune[23] < 1.5 || laser_s.is_some())
+                    && wrap(aim_to(e.eye(), my_center)[0] - e.aim[0]).abs() > 1.5;
+                if ambush {
+                    self.commit_id = e.id;
+                    self.commit_until = t + 12.0;
+                }
+                let committed = e.id == self.commit_id && t < self.commit_until && hp_frac > 0.4;
+                e.hostile_until > t || prey || busy || ambush || committed || (alive <= 4 && my_power > 1.4 * power(e))
             } else {
                 match self.policy {
                     1 => e.hostile_until > t,
@@ -878,7 +902,8 @@ impl Bot {
                     if hostiles.is_empty() {
                         true
                     } else if hostiles.len() == 1 && near <= 1 {
-                        my_power >= (if self.mode == 0 { self.tune[11] } else { self.tune[8] }) * power(hostiles[0]) || finishable
+                        let committed = hostiles[0].id == self.commit_id && t < self.commit_until && hp_frac > 0.4;
+                        committed || my_power >= (if self.mode == 0 { self.tune[11] } else { self.tune[8] }) * power(hostiles[0]) || finishable
                     } else {
                         false
                     }
@@ -999,7 +1024,7 @@ impl Bot {
                 if self.enemies.values().any(|e| t - e.seen < 6.0 && dxy(&e.pos, &it.pos) < d + 15.0) {
                     continue;
                 }
-                if d > 40.0 && threats.iter().any(|e| e.hostile_until > t && self.w.los(e.eye(), my_center)) {
+                if (d > 25.0 || climb > 3.0) && threats.iter().any(|e| e.hostile_until > t && self.w.los(e.eye(), my_center)) {
                     continue;
                 }
                 let score = d * if it.kind == "laser" { 0.7 } else { 1.0 } + climb * 3.0;
@@ -1105,7 +1130,10 @@ impl Bot {
                 }
                 match self.cover {
                     Some(c) => {
-                        if (c.0 - here.0).hypot(c.1 - here.1) < 1.5 {
+                        let dc = (c.0 - here.0).hypot(c.1 - here.1);
+                        // Even a long run to cover beats trading shots in the open: in simulation,
+                        // standing to fight when cover was over 28 m away cost 0.3 to 0.8 points.
+                        if dc < 1.5 {
                             flee_hold = true;
                         } else {
                             flee_goal = Some(c);
