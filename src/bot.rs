@@ -2175,7 +2175,8 @@ impl Bot {
             let mut bi = 0usize;
             let mut bs = i32::MIN;
             for (i, c) in ch.iter().enumerate() {
-                let s = Self::upgrade_score(c["id"].as_str().unwrap_or(""));
+                let id = c["id"].as_str().unwrap_or("");
+                let s = if self.mode == 1 { practice::upgrade_score(id) } else { None }.unwrap_or_else(|| Self::upgrade_score(id));
                 if s > bs {
                     bs = s;
                     bi = i;
