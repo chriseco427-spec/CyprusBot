@@ -190,6 +190,11 @@ fn p_lite_until() -> f32 {
     *K.get_or_init(|| std::env::var("MB_PLITE").ok().and_then(|v| v.parse().ok()).unwrap_or(16.0))
 }
 
+fn first_shot_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOFIRST").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -978,33 +983,34 @@ impl Bot {
             let allowed = if cautious {
                 // Free-for-all (or not sure yet): shoot back, finish the weak, bully only late.
                 let prey = e.hp < e.max_hp * if alive <= 4 { 0.5 } else { 0.35 } && hp_frac > 0.6 && power(e) < 0.6 * my_power;
-                // A wounded mech looking elsewhere is in someone else's fight: the cheapest cubes.
-                let busy = self.tune[14] > 0.0
-                    && e.hp < e.max_hp * self.tune[14]
-                    && hp_frac > 0.8
-                    && d < 120.0
-                    && power(e) < 0.9 * my_power
-                    && wrap(aim_to(e.eye(), my_center)[0] - e.aim[0]).abs() > 1.2;
-                // Ambush: a mech that cannot see us (we are outside its view wedge and its 45 m
-                // sensors), with nobody else around, when we are fresh. First shots land on its
-                // back, and in recorded matches whoever shoots first wins three duels in four.
                 let lonely = threats.len() == 1 && self.enemies.values().filter(|o| t - o.seen < 8.0).count() == 1;
-                let ambush = self.tune[23] > 0.5
+                // First shot (confirmed free-for-all only): a mech that is not looking at us and is
+                // either alone or busy with someone else. In recorded matches the side that lands
+                // the first hit wins three duels in four, and most of the top teams collapse when
+                // hit first. We need to be fresh, and to hold a ready laser or be close enough
+                // for the gun to count.
+                let away = wrap(aim_to(e.eye(), my_center)[0] - e.aim[0]).abs() > 1.3;
+                let busy = e.hp < 0.85 * e.max_hp
+                    || threats.iter().any(|o| o.id != e.id && dxy(&o.pos, &e.pos) < 220.0 && wrap(aim_to(e.eye(), o.center())[0] - e.aim[0]).abs() < 0.25);
+                let laser_ready = laser_s.and_then(|sl| me.wpn[sl].as_ref()).map_or(false, |w| w.cooldown <= 0.2);
+                let nobody_on_us = !threats.iter().any(|o| o.id != e.id && o.hostile_until > t);
+                let ambush = first_shot_on()
                     && self.mode == 2
                     && t > 20.0
-                    && hp_frac > 0.9
-                    && d > 50.0
-                    && d < 115.0
-                    && lonely
-                    && power(e) < 1.1 * my_power
-                    && (self.tune[23] < 1.5 || laser_s.is_some())
-                    && wrap(aim_to(e.eye(), my_center)[0] - e.aim[0]).abs() > 1.5;
+                    && hp_frac > 0.85
+                    && d > 55.0
+                    && d < 170.0
+                    && (laser_ready || d < 110.0)
+                    && away
+                    && (lonely || busy)
+                    && nobody_on_us
+                    && power(e) < 1.15 * my_power;
                 if ambush {
                     self.commit_id = e.id;
-                    self.commit_until = t + 12.0;
+                    self.commit_until = t + 10.0;
                 }
                 let committed = e.id == self.commit_id && t < self.commit_until && hp_frac > 0.4;
-                e.hostile_until > t || prey || busy || ambush || committed || (alive <= 4 && my_power > 1.4 * power(e))
+                e.hostile_until > t || prey || ambush || committed || (alive <= 4 && my_power > 1.4 * power(e))
             } else {
                 match self.policy {
                     1 => e.hostile_until > t,
