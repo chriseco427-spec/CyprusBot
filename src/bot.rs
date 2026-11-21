@@ -260,6 +260,21 @@ fn hide_knob(i: usize) -> f32 {
     })[i]
 }
 
+/// Fetch knobs (`MB_FETCH=a,b,c,d`): 0 reach (m), 1 open-street limit (m, 0 = none),
+/// 2 earliest time (s), 3 contested margin (m).
+fn fetch_knob(i: usize) -> f32 {
+    static K: std::sync::OnceLock<[f32; 4]> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let mut k = [130.0, 0.0, 10.0, 0.0];
+        if let Ok(e) = std::env::var("MB_FETCH") {
+            for (j, x) in e.split(',').enumerate().take(4) {
+                k[j] = x.parse().unwrap_or(k[j]);
+            }
+        }
+        k
+    })[i]
+}
+
 fn fetch_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOFETCH").is_err())
@@ -1376,10 +1391,11 @@ impl Bot {
         // practice has a rush of its own: flip PRACTICE_HAS_OWN_RUSH when that lands.
         const PRACTICE_HAS_OWN_RUSH: bool = true;
         let mut ffa_rush: Option<(f32, (f32, f32), i64)> = None;
-        // Confirmed free-for-all, gun only, after 20 s: walk (never boost) to an uncontested
-        // special within 90 m. With the rush off we went gun-only all match in 3 of 6 matches at
+        // Confirmed free-for-all, gun only, after 10 s: walk (never boost) to a special within
+        // 130 m that no known mech is nearer to. The open-street check is off here: in the
+        // simulator it blocked most fetches (special by 60 s: 57% with it, 66% without). With the rush off we went gun-only all match in 3 of 6 matches at
         // 5 AM, and holding a laser for most of a match goes with 9.8 points against 5.2 gun-only.
-        let ffa_walk = self.mode == 2 && fetch_on() && fx(15) >= 0.5 && t >= 20.0 && me.wpn[1].is_none() && hp_frac > 0.5;
+        let ffa_walk = self.mode == 2 && fetch_on() && fx(15) >= 0.5 && t >= fetch_knob(2) && me.wpn[1].is_none() && hp_frac > 0.5;
         if ffa_walk || (self.tune[13] < 0.5 && fx(15) < 0.5 && me.wpn[1].is_none() && (self.mode != 1 || !PRACTICE_HAS_OWN_RUSH)) {
             for (id, it) in &self.pickups {
                 if self.blacklist.get(id).map_or(false, |u| t < *u) || !(it.kind == "laser" || it.kind == "lightning") {
@@ -1387,21 +1403,23 @@ impl Bot {
                 }
                 let d = dxy(&it.pos, &me.pos);
                 let climb = (it.pos[2] - me.pos[2]).max(0.0);
-                if d > (if ffa_walk { 90.0 } else { 130.0 }) || climb > 3.0 || !in_bounds(&it.pos) {
+                if d > (if ffa_walk { fetch_knob(0) } else { 130.0 }) || climb > 3.0 || !in_bounds(&it.pos) {
                     continue;
                 }
                 if ffa_walk && self.npc_mem.values().any(|n| (n.0[0] - it.pos[0]).hypot(n.0[1] - it.pos[1]) < 50.0) {
                     continue;
                 }
                 // Someone else closer to it, or a shooter between us and a long run: leave it.
-                if self.enemies.values().any(|e| t - e.seen < 6.0 && dxy(&e.pos, &it.pos) < d + 15.0) {
+                let margin = if ffa_walk { fetch_knob(3) } else { 15.0 };
+                if self.enemies.values().any(|e| t - e.seen < 6.0 && dxy(&e.pos, &it.pos) < d + margin) {
                     continue;
                 }
                 if (d > 25.0 || climb > 3.0) && threats.iter().any(|e| e.hostile_until > t && self.w.los(e.eye(), my_center)) {
                     continue;
                 }
                 // A run across open streets is how we got shot in three of four 1 AM openings.
-                if fx(7) > 0.0 && d > 25.0 && self.open_run(here, (it.pos[0], it.pos[1])) > fx(7) {
+                let open_limit = if ffa_walk { fetch_knob(1) } else { fx(7) };
+                if open_limit > 0.0 && d > 25.0 && self.open_run(here, (it.pos[0], it.pos[1])) > open_limit {
                     continue;
                 }
                 let score = d * if it.kind == "laser" { 0.7 } else { 1.0 } + climb * 3.0;
