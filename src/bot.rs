@@ -561,13 +561,6 @@ impl Bot {
                 if self.tune[16] != 0.0 {
                     score -= self.tune[16] * ((x - z.nc[0]).hypot(y - z.nc[1]) / z.nr.max(1.0)).min(1.0) * 30.0;
                 }
-                if self.tune[19] != 0.0 {
-                    for e in self.enemies.values() {
-                        if t - e.seen < 20.0 {
-                            score += self.tune[19] * (1.0 - ((e.pos[0] - x).hypot(e.pos[1] - y) / 250.0).min(1.0)) * 30.0;
-                        }
-                    }
-                }
                 if best.map_or(true, |b| score < b.0) {
                     best = Some((score, (x, y)));
                 }
@@ -1165,8 +1158,13 @@ impl Bot {
         // one is worth killing for its cubes, but two or more at once, or any while we are hurt or
         // the opening scramble is on, is a fight to walk away from.
         let drones_near = npcs.iter().filter(|n| dxy(&n.0, &me.pos) < 62.0).count();
-        let drone_flee = self.tune[15] < 1.5 && !npcs.is_empty() && t - self.npc_hurt_t < 3.0 && (drones_near >= 2 || hp_frac < 0.7 || t < 25.0);
-        if self.tune[15] < 0.5 && !drone_flee && drones_near <= 1 && target.is_none() && hp_frac > 0.75 && quiet && t >= 25.0 {
+        let enemy_los = threats.iter().any(|e| self.w.los(e.eye(), my_center));
+        // A drone is hitting us and no mech can see us: deal with it now, even from a hiding spot
+        // (sitting in one drone's fire while hiding from a mech cost 438 HP in a recorded match).
+        let drone_hot = self.tune[15] < 1.5 && t - self.npc_hurt_t < 2.5 && !npcs.is_empty() && target.is_none() && !enemy_los;
+        let drone_flee = drone_hot && drones_near >= 2;
+        let farm_drone = self.tune[15] < 0.5 && drones_near <= 1 && target.is_none() && hp_frac > 0.75 && quiet && t >= 25.0;
+        if !drone_flee && ((drone_hot && drones_near == 1 && hp_frac > 0.2) || farm_drone) {
             let mut bd = 85.0;
             for n in &npcs {
                 let d = d3(muzzle, n.0);
@@ -1308,6 +1306,35 @@ impl Bot {
             // On foot in the opening unless it is right here: boosting from second 1 left us at
             // 11 to 41 energy and hit in the open at 1 AM.
             mv = Mv::Goto(r.1, me.energy > 15.0 && (t >= fx(5) || (r.1 .0 - here.0).hypot(r.1 .1 - here.1) < 25.0));
+        } else if drone_flee && target.is_none() {
+            // Step out of the drones' reach: straight away from their middle.
+            let (mut sx, mut sy, mut k) = (0.0, 0.0, 0.0);
+            for n in &npcs {
+                if dxy(&n.0, &me.pos) < 70.0 {
+                    sx += n.0[0];
+                    sy += n.0[1];
+                    k += 1.0;
+                }
+            }
+            let away = if k > 0.0 { norm2([here.0 - sx / k, here.1 - sy / k]) } else { [0.0, 0.0] };
+            let mut g = None;
+            for len in [45.0f32, 30.0, 18.0] {
+                let p = [here.0 + away[0] * len, here.1 + away[1] * len];
+                if in_bounds(&p) && self.w.free_at(p[0], p[1]) {
+                    g = Some((p[0], p[1]));
+                    break;
+                }
+            }
+            mv = match g {
+                Some(g) => Mv::Goto(g, me.energy > 30.0),
+                None => Mv::Goto(zone_point, false),
+            };
+        } else if let (Some(n), true) = (shoot_npc, drone_hot || threats.is_empty()) {
+            // Circle the drone at a distance where its slow bullets miss a moving mech.
+            let to = [n.0[0] - here.0, n.0[1] - here.1];
+            let d = to[0].hypot(to[1]).max(0.1);
+            let out = self.strafe_vec(here, me.pos[2], [to[0] / d, to[1] / d], d, 60.0, t, &z);
+            mv = Mv::Direct(out, false);
         } else if flee_hold {
             mv = Mv::Hold;
         } else if let Some(c) = flee_goal {
@@ -1344,35 +1371,6 @@ impl Bot {
             } else {
                 mv = Mv::Hold;
             }
-        } else if drone_flee && target.is_none() {
-            // Step out of the drones' reach: straight away from their middle.
-            let (mut sx, mut sy, mut k) = (0.0, 0.0, 0.0);
-            for n in &npcs {
-                if dxy(&n.0, &me.pos) < 70.0 {
-                    sx += n.0[0];
-                    sy += n.0[1];
-                    k += 1.0;
-                }
-            }
-            let away = if k > 0.0 { norm2([here.0 - sx / k, here.1 - sy / k]) } else { [0.0, 0.0] };
-            let mut g = None;
-            for len in [45.0f32, 30.0, 18.0] {
-                let p = [here.0 + away[0] * len, here.1 + away[1] * len];
-                if in_bounds(&p) && self.w.free_at(p[0], p[1]) {
-                    g = Some((p[0], p[1]));
-                    break;
-                }
-            }
-            mv = match g {
-                Some(g) => Mv::Goto(g, me.energy > 30.0),
-                None => Mv::Goto(zone_point, false),
-            };
-        } else if let (Some(n), true) = (shoot_npc, threats.is_empty()) {
-            // Circle the drone at a distance where its slow bullets miss a moving mech.
-            let to = [n.0[0] - here.0, n.0[1] - here.1];
-            let d = to[0].hypot(to[1]).max(0.1);
-            let out = self.strafe_vec(here, me.pos[2], [to[0] / d, to[1] / d], d, 60.0, t, &z);
-            mv = Mv::Direct(out, false);
         } else {
             // Idle: supply drop, cubes, weapons, crates, then explore inside the next circle.
             let mut goal: Option<(f32, (f32, f32), i64)> = None;
@@ -1493,6 +1491,7 @@ impl Bot {
             }
         }
 
+        let weave_ok = matches!(mv, Mv::Goto(..));
         let mut jump = false;
         let (mut mvec, mut boost) = match mv {
             Mv::Goto(g, b) => {
@@ -1556,6 +1555,22 @@ impl Bot {
             Mv::Direct(v, b) => (v, b),
             Mv::Hold => ([0.0, 0.0], false),
         };
+
+        // Shot at while walking somewhere: swing side to side around the heading, reversing like
+        // a strafe. Off by default (tune[19] = 0): neutral in simulation, and it slows the walk.
+        if weave_ok && self.tune[19] > 0.0 && t - self.last_hurt_t < 1.2 && me.grounded && t >= self.climb_until && mvec[0].hypot(mvec[1]) > 0.8 {
+            if t >= self.strafe_until {
+                if self.rand() < 0.85 {
+                    self.strafe_dir = -self.strafe_dir;
+                }
+                self.strafe_until = t + self.tune[6] + self.tune[7] * self.rand();
+            }
+            let sd = self.strafe_dir * self.tune[19];
+            let cand = norm2([mvec[0] - mvec[1] * sd, mvec[1] + mvec[0] * sd]);
+            if self.open_dir(here, me.pos[2], cand) {
+                mvec = cand;
+            }
+        }
 
         // ---- stuck detection (only when we mean to travel)
         let travelling = matches!(mv, Mv::Goto(..)) && mvec[0].hypot(mvec[1]) > 0.6;
@@ -1670,6 +1685,10 @@ impl Bot {
                 }
             }
             aim = aim_to(muzzle, aim_pt);
+        } else if t - self.ghost_t < 1.5 {
+            // Hit by a mech we cannot see: look that way first. Tracking someone else while a
+            // sniper works on us cost 990 HP for nothing in a recorded match.
+            aim = [self.hurt_bearing, 0.0];
         } else if let Some(e) = threats.iter().min_by(|a, b| dxy(&a.pos, &me.pos).partial_cmp(&dxy(&b.pos, &me.pos)).unwrap()) {
             // Pre-aim where a tracked enemy will appear; keep a laser charged for it.
             aim = aim_to(muzzle, e.center());
