@@ -152,7 +152,7 @@ pub struct Bot {
     blacklist: HashMap<i64, f32>,
     /// 0 = shoot anything, 1 = only mechs that threaten us, 2 = also unaware mechs when safe.
     policy: u8,
-    tune: [f32; 4],
+    tune: [f32; 8],
     kills: i64,
     ffa: bool,
 }
@@ -217,9 +217,11 @@ impl Bot {
             kills: 0,
             ffa: false,
             tune: {
-                let mut v = [55.0, 0.40, 0.75, 0.0];
+                // range, retreat hp, retreat hp when outnumbered, retreat in squad mode,
+                // hostile bonus, hp weight, strafe base, strafe spread
+                let mut v = [55.0, 0.40, 0.75, 0.0, 40.0, 0.08, 0.4, 0.9];
                 if let Ok(e) = std::env::var("MB_TUNE") {
-                    for (i, x) in e.split(',').enumerate().take(4) {
+                    for (i, x) in e.split(',').enumerate().take(8) {
                         v[i] = x.parse().unwrap_or(v[i]);
                     }
                 }
@@ -517,7 +519,7 @@ impl Bot {
                 _ => true,
             };
             if allowed && d < 260.0 && self.w.los(muzzle, e.center()) {
-                let score = d + 0.08 * e.hp - if t - e.hurt_me_t < 3.0 { 40.0 } else { 0.0 };
+                let score = d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 };
                 if score < best {
                     best = score;
                     target = Some(e.clone());
@@ -686,7 +688,7 @@ impl Bot {
                 if self.rand() < 0.6 {
                     self.strafe_dir = -self.strafe_dir;
                 }
-                self.strafe_until = t + 0.4 + 0.9 * self.rand();
+                self.strafe_until = t + self.tune[6] + self.tune[7] * self.rand();
             }
             let radial = ((d - range) / 20.0).clamp(-1.0, 1.0) * 0.8;
             let mut out = [0.0, 0.0];
