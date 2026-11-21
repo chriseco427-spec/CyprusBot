@@ -6,4 +6,4 @@
 //! to 3 plays exactly like the single `RNG_SALT = 3` build (f0a08f8). Change one entry per
 //! submission.
 
-pub const SALTS: [u64; 8] = [3, 3, 3, 3, 3, 3, 3, 3];
+pub const SALTS: [u64; 8] = [3, 3, 1003, 3, 3, 3, 3, 3];
