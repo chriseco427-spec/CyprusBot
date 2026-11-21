@@ -326,6 +326,9 @@ pub struct Bot {
     escape_until: f32,
     /// Replay marker (look straight up for 0.4 s once, on confirmed free-for-all): when it ran.
     marker_t: f32,
+    /// When our laser charge reached full (the reported charge stops at full, so how long it has
+    /// been held must be timed here), or -1.
+    full_since: f32,
     climb_goal: (f32, f32),
     blacklist: HashMap<i64, f32>,
     policy: u8,
@@ -455,6 +458,7 @@ impl Bot {
             climb_until: -1.0,
             escape_until: -1.0,
             marker_t: -1.0,
+            full_since: -1.0,
             climb_goal: (0.0, 0.0),
             blacklist: HashMap::new(),
             policy: cfg.policy,
@@ -2027,6 +2031,23 @@ impl Bot {
         }
 
         // ---- aim and fire
+        // How long a full laser charge has been held. The server reports charge only up to full
+        // (0.75 s) and auto-fires 2 s later, so a cap on the reported value never triggers: 15 of
+        // our 21 misses on charges held past 0.9 s ran to the 2.75 s auto-fire into a wall after
+        // the target stepped behind cover.
+        let full_held = match laser_s.and_then(|s| me.wpn[s].as_ref()) {
+            Some(w) if w.charge >= w.full_charge - 0.06 => {
+                if self.full_since < 0.0 {
+                    self.full_since = t;
+                }
+                t - self.full_since
+            }
+            _ => {
+                self.full_since = -1.0;
+                0.0
+            }
+        };
+        let timed_hold = self.mode == 2 && std::env::var("MB_NOTIMEDHOLD").is_err();
         let mut fire = [false, false];
         let mut laser_release = false;
         let mut aim;
@@ -2060,7 +2081,7 @@ impl Bot {
                     // Release at full charge, on target, and only once the target has been in our
                     // line of fire for a moment: in recorded matches, shots within 0.3 s of the
                     // target appearing hit 38%, full charges after that 84 to 96%.
-                    let settled = fx(0) < 0.5 || t - self.los_since >= fx(2);
+                    let settled = fx(0) < 0.5 || t - self.los_since >= fx(2) || (timed_hold && full_held >= 0.4);
                     if ready && on(direct) && settled {
                         laser_release = true;
                     }
@@ -2086,7 +2107,8 @@ impl Bot {
                 // Also when we are hiding and it is walking up on us: meet it with a full charge.
                 let ambush_hold = self.tune[23] > 0.5 && self.retreating && flee_hold_now && dxy(&e.pos, &me.pos) < 80.0;
                 let hold_cap = if ambush_hold { 1.6 } else if fx(0) > 0.5 { fx(1) } else { 1.4 };
-                if (!self.retreating || ambush_hold) && w.cooldown <= 0.1 && dxy(&e.pos, &me.pos) < 150.0 && w.charge < w.full_charge + hold_cap {
+                let within_cap = if timed_hold { full_held < hold_cap } else { w.charge < w.full_charge + hold_cap };
+                if (!self.retreating || ambush_hold) && w.cooldown <= 0.1 && dxy(&e.pos, &me.pos) < 150.0 && within_cap {
                     fire[s] = true;
                 }
             }
@@ -2162,7 +2184,8 @@ impl Bot {
         // until the shot fires on its own.
         if let Some(s) = laser_s {
             let w = me.wpn[s].as_ref().unwrap();
-            if fx(0) > 0.5 && w.charge > 0.0 && !fire[s] && !laser_release && w.charge < w.full_charge + fx(1) {
+            let within_cap = if timed_hold { full_held < fx(1) } else { w.charge < w.full_charge + fx(1) };
+            if fx(0) > 0.5 && w.charge > 0.0 && !fire[s] && !laser_release && within_cap {
                 fire[s] = true;
             }
         }
