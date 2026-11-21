@@ -1395,7 +1395,11 @@ impl Bot {
         // 130 m that no known mech is nearer to. The open-street check is off here: in the
         // simulator it blocked most fetches (special by 60 s: 57% with it, 66% without). With the rush off we went gun-only all match in 3 of 6 matches at
         // 5 AM, and holding a laser for most of a match goes with 9.8 points against 5.2 gun-only.
-        let ffa_walk = self.mode == 2 && fetch_on() && fx(15) >= 0.5 && t >= fetch_knob(2) && me.wpn[1].is_none() && hp_frac > 0.5;
+        let ffa_walk = self.mode == 2 && fetch_on() && fx(15) >= 0.5 && t >= fetch_knob(2) && me.wpn[1].is_none() && hp_frac > 0.5
+            // Never within 6 s of being hit: the 1 to 2 AM deaths at 14 s and 17 s were runs across
+            // open ground under fire. (Also blocking it while hiding from any mech seen in the last
+            // 10 s took away nearly all the fetches in the simulator.)
+            && t - self.last_hurt_t > 6.0;
         if ffa_walk || (self.tune[13] < 0.5 && fx(15) < 0.5 && me.wpn[1].is_none() && (self.mode != 1 || !PRACTICE_HAS_OWN_RUSH)) {
             for (id, it) in &self.pickups {
                 if self.blacklist.get(id).map_or(false, |u| t < *u) || !(it.kind == "laser" || it.kind == "lightning") {
