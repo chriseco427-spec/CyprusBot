@@ -621,7 +621,7 @@ impl Bot {
         } else {
             // Idle: supply drop, cubes, weapons, crates, then explore inside the next circle.
             let mut goal: Option<(f32, (f32, f32))> = None;
-            let mut consider = |score: f32, p: &[f32; 3], goal: &mut Option<(f32, (f32, f32))>| {
+            let consider = |score: f32, p: &[f32; 3], goal: &mut Option<(f32, (f32, f32))>| {
                 if goal.map_or(true, |g| score < g.0) {
                     *goal = Some((score, (p[0], p[1])));
                 }
@@ -736,19 +736,17 @@ impl Bot {
 
         // ---- aim and fire
         let mut fire = [false, false];
-        let mut aim = self.last_aim;
+        let mut aim;
         let mut reload = false;
-        let mut lead_pt: Option<[f32; 3]> = None;
         if let Some(e) = &target {
             let c0 = e.center();
             let speed = gun_s.and_then(|s| me.wpn[s].as_ref()).map_or(252.0, |w| w.speed);
             let mut p = c0;
             for _ in 0..4 {
+                // Plain linear lead: it scored best against recorded opponent movement at every range.
                 let tt = d3(muzzle, p) / speed + 0.05;
-                let k = if tt < 0.25 { 1.0 } else { (1.0 - 0.8 * (tt - 0.25)).max(0.6) };
-                p = [c0[0] + e.vel[0] * tt * k, c0[1] + e.vel[1] * tt * k, c0[2] + (e.vel[2] * tt * k).clamp(-2.0, 2.0)];
+                p = [c0[0] + e.vel[0] * tt, c0[1] + e.vel[1] * tt, c0[2] + (e.vel[2] * tt).clamp(-2.0, 2.0)];
             }
-            lead_pt = Some(p);
             let direct = [c0[0] + e.vel[0] * 0.08, c0[1] + e.vel[1] * 0.08, c0[2]];
             let d = d3(muzzle, c0);
             let scale = 1.0 + 0.05 * e.cubes;
@@ -825,7 +823,6 @@ impl Bot {
                 reload = true;
             }
         }
-        let _ = lead_pt;
         aim[1] = aim[1].clamp(-0.7, 1.3);
         if !aim[0].is_finite() || !aim[1].is_finite() {
             aim = [0.0, 0.0];
