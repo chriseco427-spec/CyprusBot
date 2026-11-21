@@ -280,15 +280,18 @@ impl Bot {
     fn find_cover(&self, me: &Me, threats: &[Enemy], z: &Zone) -> Option<(f32, f32)> {
         let w = &self.w;
         let mut best: Option<(f32, (f32, f32))> = None;
+        let mut threats: Vec<&Enemy> = threats.iter().filter(|e| dxy(&e.pos, &me.pos) < 260.0).collect();
+        threats.sort_by(|a, b| dxy(&a.pos, &me.pos).partial_cmp(&dxy(&b.pos, &me.pos)).unwrap_or(std::cmp::Ordering::Equal));
+        threats.truncate(3);
         let (cx, cy) = ((me.pos[0] * 0.5).round() * 2.0, (me.pos[1] * 0.5).round() * 2.0);
         // Lattice-aligned candidates (world grid origin is integral).
         let ox = (w.min_x.rem_euclid(2.0)) - (cx.rem_euclid(2.0));
         let oy = (w.min_y.rem_euclid(2.0)) - (cy.rem_euclid(2.0));
-        let n = 23i32;
+        let n = 11i32;
         for j in -n..=n {
             for i in -n..=n {
-                let x = cx + ox + 2.0 * i as f32;
-                let y = cy + oy + 2.0 * j as f32;
+                let x = cx + ox + 4.0 * i as f32;
+                let y = cy + oy + 4.0 * j as f32;
                 let d = (x - me.pos[0]).hypot(y - me.pos[1]);
                 if d > 46.0 {
                     continue;
@@ -306,7 +309,7 @@ impl Bot {
                 }
                 let mut cost = d;
                 let mut near = f32::INFINITY;
-                for e in threats {
+                for e in &threats {
                     near = near.min((x - e.pos[0]).hypot(y - e.pos[1]));
                 }
                 if near < 25.0 {
@@ -334,7 +337,7 @@ impl Bot {
             || t - self.path_t > 1.5
             || self.path_i >= self.path.len();
         if need {
-            self.path = self.nav.path(&self.w, me.pos, goal, 25_000);
+            self.path = self.nav.path(&self.w, me.pos, goal, 12_000);
             self.path_goal = goal;
             self.path_t = t;
             self.path_i = 0;
