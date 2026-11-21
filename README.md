@@ -14,6 +14,9 @@ protocol: JSON lines on stdin and stdout, one action per observation.
   free-for-alls (mechs dying that it did not kill) and plays the two differently.
 - `src/practice.rs`: behaviour used only in confirmed practice matches.
 - `src/cover.rs`: getting out of a laser's or a lightning carrier's line of fire.
+- `src/salts.rs`: practice: per-match-group RNG salts selected by submission testing. On the
+  first observation the bot hashes its slot and the first next-circle centre into one of 8
+  groups and seeds its random choices (strafe timing, wander points) with that group's salt.
 
 ## Build and check
 
