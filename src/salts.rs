@@ -30,5 +30,5 @@
 //!        weapon walks across open street; the practice play of the builds before that commit)
 //! Bits add up (5 = laser hunt and heal). Change one entry per submission.
 
-pub const SALTS: [u64; 32] = [3,1002,4,4,4,4,4,3, 3,1002,4,4,3,4,4,3, 3,1002,4,4,3,4,4,3, 3,1002,4,4,3,4,4,3];
-pub const VARIANT: [u16; 8] = [16, 0, 0, 0, 0, 0, 0, 0];
+pub const SALTS: [u64; 32] = [2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007,2007];
+pub const VARIANT: [u16; 8] = [2048,2048,2048,2048,2048,2048,2048,2048];
