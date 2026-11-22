@@ -150,6 +150,10 @@ impl Cfg {
     /// hp weight, strafe base, strafe spread, power ratio needed to accept a duel when cautious,
     /// seconds before assuming practice, cornered distance, the same duel ratio while the match type is unknown
     pub const TUNE: [f32; 24] = [55.0, 0.40, 0.75, 0.0, 40.0, 0.08, 0.45, 0.5, 1.3, 8.0, 40.0, 1.3, 0.0, 0.0, 0.0, 0.0, 0.0, 14.0, 0.0, 0.0, 1.0, 0.7, 14.0, 0.0];
+    /// Who we may open fire on in practice once the guarded opening is over. 0: any house bot in
+    /// sight. 1: only one that is hostile to us. 2: hostile ones, or anyone while none is hostile
+    /// and we are above 90% HP.
+    pub const POLICY: u8 = 0;
     pub fn from_env() -> Cfg {
         let mut tune = Self::TUNE;
         if let Ok(e) = std::env::var("MB_TUNE") {
@@ -158,7 +162,8 @@ impl Cfg {
             }
         }
         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(0u8);
-        Cfg { mode: num("MB_MODE"), policy: num("MB_POLICY"), tune }
+        let policy = std::env::var("MB_POLICY").ok().and_then(|v| v.parse().ok()).unwrap_or(Self::POLICY);
+        Cfg { mode: num("MB_MODE"), policy, tune }
     }
 }
 
@@ -1988,10 +1993,17 @@ impl Bot {
             let d = to[0].hypot(to[1]).max(0.1);
             let dir = [to[0] / d, to[1] / d];
             let mut range = self.tune[0];
+            // Confirmed practice: stand off further, by weapon (practice knobs 15 and 16).
+            if self.mode == 1 {
+                let pr = practice::knob(if laser_s.is_some() { 16 } else { 15 });
+                if pr > 0.0 {
+                    range = pr;
+                }
+            }
             if light_s.is_some() && me.energy > 25.0 {
                 range = 30.0;
             } else if e.has("lightning") {
-                range = 65.0;
+                range = range.max(65.0);
             }
             let out = self.strafe_vec(here, me.pos[2], dir, d, range, t, &z);
             let burst = me.energy > 55.0 && (t * 1.3).sin() > 0.3;
