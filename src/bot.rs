@@ -109,6 +109,10 @@ impl Enemy {
     fn eye(&self) -> [f32; 3] {
         [self.pos[0], self.pos[1], self.pos[2] + 8.0 * (1.0 + 0.05 * self.cubes)]
     }
+    /// A point in the upper body: 7.5 m up on a 9 m mech.
+    fn upper(&self) -> [f32; 3] {
+        [self.pos[0], self.pos[1], self.pos[2] + 0.83 * self.height()]
+    }
     fn has(&self, k: &str) -> bool {
         self.weapons.iter().any(|w| w == k)
     }
@@ -229,6 +233,32 @@ pub(crate) fn pf(i: usize) -> bool {
     static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let m = *K.get_or_init(|| {
         std::env::var("MB_PF").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| PF.iter().enumerate().fold(0u32, |a, (i, on)| a | ((*on as u32) << i)))
+    });
+    (m >> i) & 1 == 1
+}
+
+/// Fire rate (modes 0 and 1 only; a confirmed free-for-all is unchanged). Each constant removes one
+/// thing that kept a ready weapon from firing; `false` restores the older behaviour.
+/// - gun gate: fire when the aim is within 3.0 m of the lead point (was 2.2 m; the body is 2.5 m
+///   wide and the gun was ready but silent in 5% of fight time for want of the last metre).
+///   Off: 2% more shots, no more damage, and 0.13 points lower in simulated practice.
+const FR_GUN_GATE: bool = false;
+/// - upper body: when a mech's centre is behind cover but its upper body is in our line of fire
+///   (a shooter back from a roof edge, a low wall), shoot at the upper body instead of not at all.
+const FR_TOP_AIM: bool = true;
+/// - late switch: move the aim from the gun's lead point to the laser's direct line 0.15 s before
+///   the charge is full (was 0.3 s; the torso needs one decision to get there), so the gun keeps
+///   firing longer. Off: slightly less damage and 0.05 points lower in simulated practice.
+const FR_LATE_DIRECT: bool = false;
+/// - long hold: keep a full charge for up to 1.5 s (was 0.3 s) while the mech it is meant for is
+///   tracked behind cover, instead of firing it into the wall and waiting out the cooldown.
+const FR_LONG_HOLD: bool = true;
+const FR: [bool; 4] = [FR_GUN_GATE, FR_TOP_AIM, FR_LATE_DIRECT, FR_LONG_HOLD];
+/// Is fire-rate change `i` on? `MB_FR=<bit mask>` overrides the constants in the simulator.
+fn fr(i: usize) -> bool {
+    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let m = *K.get_or_init(|| {
+        std::env::var("MB_FR").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| FR.iter().enumerate().fold(0u32, |a, (i, on)| a | ((*on as u32) << i)))
     });
     (m >> i) & 1 == 1
 }
@@ -1769,7 +1799,7 @@ impl Bot {
                     _ => !p_lite || e.hostile_until > t,
                 }
             };
-            if allowed && d < 260.0 && self.w.los(muzzle, e.center()) {
+            if allowed && d < 260.0 && (self.w.los(muzzle, e.center()) || (self.mode != 2 && fr(1) && self.w.los(muzzle, e.upper()))) {
                 let mut score = d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 };
                 // Free-for-all: our laser does 60% more to a mortar carrier.
                 if (self.mode == 2 || pf(6)) && mortar_first_on() && laser_s.is_some() && e.has("mortar") {
@@ -2825,7 +2855,9 @@ impl Bot {
         let mut aim;
         let mut reload = false;
         if let Some(e) = &target {
-            let c0 = e.center();
+            // Centre of the body, or its upper part when only that is in our line of fire.
+            let top = self.mode != 2 && fr(1) && !self.w.los(muzzle, e.center()) && self.w.los(muzzle, e.upper());
+            let c0 = if top { e.upper() } else { e.center() };
             let speed = gun_s.and_then(|s| me.wpn[s].as_ref()).map_or(252.0, |w| w.speed);
             let lead_k = self.lead_factor(e.id, d3(muzzle, c0) / speed + 0.05, t);
             let mut p = c0;
@@ -2839,8 +2871,16 @@ impl Bot {
             let on = |pt: [f32; 3]| -> bool {
                 let a = aim_to(muzzle, pt);
                 let dd = dxy(&pt, &muzzle).max(1.0);
-                wrap(a[0] - me.aim[0]).abs() * dd < 2.2 * scale && (a[1] - me.aim[1]).abs() * dd < 3.6 * scale
+                wrap(a[0] - me.aim[0]).abs() * dd < 2.2 * scale && (a[1] - me.aim[1]).abs() * dd < (if top { 1.2 } else { 3.6 }) * scale
             };
+            // The gun's own gate is a little wider outside a confirmed free-for-all.
+            let gun_w = if self.mode != 2 && fr(0) { 3.0 } else { 2.2 };
+            let on_gun = |pt: [f32; 3]| -> bool {
+                let a = aim_to(muzzle, pt);
+                let dd = dxy(&pt, &muzzle).max(1.0);
+                wrap(a[0] - me.aim[0]).abs() * dd < gun_w * scale && (a[1] - me.aim[1]).abs() * dd < (if top { 1.2 } else { 3.6 }) * scale
+            };
+            let direct_lead = if self.mode != 2 && fr(2) { 0.15 } else { 0.3 };
             let mut aim_pt = p;
             // Laser: charge while we have the line, release at full charge when on target.
             if let Some(s) = laser_s {
@@ -2854,7 +2894,7 @@ impl Bot {
                         let dmg = w.damage * frac * (1.0 + 0.04 * me.cubes.min(10.0)) * if e.has("mortar") { 1.6 } else { 1.0 };
                         dmg >= LASER_EARLY_MARGIN * e.hp && self.w.los(muzzle, c0)
                     };
-                    if w.charge >= w.full_charge - 0.3 || early {
+                    if w.charge >= w.full_charge - direct_lead || early {
                         aim_pt = direct;
                     }
                     // Release at full charge, on target, and only once the target has been in our
@@ -2869,7 +2909,7 @@ impl Bot {
             }
             if let Some(s) = gun_s {
                 let w = me.wpn[s].as_ref().unwrap();
-                if d < w.range - 3.0 && w.ammo > 0.0 && w.reload <= 0.0 && on(p) {
+                if d < w.range - 3.0 && w.ammo > 0.0 && w.reload <= 0.0 && on_gun(p) {
                     fire[s] = true;
                 }
             }
@@ -2885,7 +2925,10 @@ impl Bot {
                 let w = me.wpn[s].as_ref().unwrap();
                 // Also when we are hiding and it is walking up on us: meet it with a full charge.
                 let ambush_hold = self.tune[23] > 0.5 && self.retreating && flee_hold_now && dxy(&e.pos, &me.pos) < 80.0;
-                let hold_cap = if ambush_hold { 1.6 } else if fx(0) > 0.5 { fx(1) } else { 1.4 };
+                // Outside a confirmed free-for-all, with our own charge timer: keep the full charge
+                // for the tracked mech rather than spend it on the wall after 0.3 s.
+                let long_hold = self.mode != 2 && fr(3) && timed_hold;
+                let hold_cap = if ambush_hold { 1.6 } else if long_hold { 1.5 } else if fx(0) > 0.5 { fx(1) } else { 1.4 };
                 let within_cap = if timed_hold { full_held < hold_cap } else { w.charge < w.full_charge + hold_cap };
                 if (!self.retreating || ambush_hold) && w.cooldown <= 0.1 && dxy(&e.pos, &me.pos) < 150.0 && within_cap {
                     fire[s] = true;
