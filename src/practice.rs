@@ -4,6 +4,11 @@
 use super::{dxy, Bot, Enemy, Me};
 use std::sync::OnceLock;
 
+/// Retreat-and-heal switch: 0 = off (behaves exactly like the build it is applied to),
+/// 1 = R1 (HP below 35% and 3 or more mechs tracked), 2 = R2 (HP below 35%, any number of hunters).
+/// Both heal to 90% and hold fire meanwhile, from the start of practice mode.
+pub(super) const RETREAT_HEAL: u8 = 2;
+
 /// Practice knobs. Defaults ship; `PR_TUNE=a,b,c` overrides them for simulator experiments.
 /// 0: laser rush on (1) / off (0)   1: laser reach m   2: lightning reach m   3: roof penalty m
 /// 4: trade lightning for a laser (1) / keep it (0)   5: no enemy closer than this (m) while swapping
@@ -12,12 +17,18 @@ use std::sync::OnceLock;
 /// 12: follow up a hunter we wounded below this HP fraction (0 = off)   13: only while our HP
 ///     fraction is above this
 /// 14: offense-first upgrades in practice (1) / shared order (0)
+/// 15-22: reserved
+/// 23: break-and-heal (1): with HP below knob 25 and at least knob 26 mechs tracked (0 = any),
+///     break line of sight and hold fire until regenerated to 90%. Set from RETREAT_HEAL.
+/// 24: kills needed first (0 = none)   25: HP fraction below which it starts   26: mechs tracked
 pub(super) fn knob(i: usize) -> f32 {
-    static K: OnceLock<[f32; 15]> = OnceLock::new();
+    static K: OnceLock<[f32; 27]> = OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.65, 0.5, 1.0];
+        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.65, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.35, 3.0];
+        k[23] = if RETREAT_HEAL > 0 { 1.0 } else { 0.0 };
+        k[26] = if RETREAT_HEAL == 2 { 0.0 } else { 3.0 };
         if let Ok(e) = std::env::var("PR_TUNE") {
-            for (j, x) in e.split(',').enumerate().take(15) {
+            for (j, x) in e.split(',').enumerate().take(27) {
                 k[j] = x.parse().unwrap_or(k[j]);
             }
         }

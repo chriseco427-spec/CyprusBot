@@ -1622,7 +1622,19 @@ impl Bot {
             }
             self.retreating = evade;
         } else if self.tune[3] < 0.5 {
-            self.retreating = false;
+            // Practice break-and-heal (knob 23, off unless practice::RETREAT_HEAL is set): badly hurt
+            // with enough hunters about (knob 26 tracked, 0 = any), break line of sight and
+            // regenerate instead of trading to the death. Kills gate knob 24 is 0 (always open).
+            let heal = self.mode == 1 && practice::knob(23) > 0.5 && self.kills as f32 >= practice::knob(24);
+            let tracked = self.enemies.values().filter(|e| t - e.seen < 8.0).count() as f32;
+            if heal && !self.retreating && !finishable && hp_frac < practice::knob(25) && tracked >= practice::knob(26) {
+                self.retreating = true;
+                self.cover = None;
+            } else if heal && self.retreating && !(hp_frac >= 0.9 || (threats.is_empty() && hp_frac >= 0.7 && t - self.last_hurt_t > 6.0)) {
+                // keep healing
+            } else {
+                self.retreating = false;
+            }
         } else if !self.retreating {
             if !threats.is_empty() && !finishable && (hp_frac < self.tune[1] || (attackers >= 2 && hp_frac < self.tune[2])) {
                 self.retreating = true;
@@ -2549,6 +2561,11 @@ impl Bot {
                     }
                 }
             }
+        }
+        // Practice break-and-heal (knob 23): dealing damage also resets the regeneration clock, so
+        // hold fire while healing. Only this rule sets `retreating` in practice.
+        if self.mode == 1 && self.retreating && practice::knob(23) > 0.5 {
+            fire = [false, false];
         }
         // Reload in quiet moments.
         if let Some(s) = gun_s {
