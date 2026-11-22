@@ -12,12 +12,18 @@ use std::sync::OnceLock;
 /// 12: follow up a hunter we wounded below this HP fraction (0 = off)   13: only while our HP
 ///     fraction is above this
 /// 14: offense-first upgrades in practice (1) / shared order (0)
+/// 15: practice fight range (m) with the gun only (0 = the shared range)
+/// 16: practice fight range (m) while we hold a laser (0 = the shared range)
+/// 17-22: reserved
+/// 23: break-and-heal (1): with HP below knob 25 and at least knob 26 mechs tracked (0 = any),
+///     break line of sight and hold fire until regenerated to 90%. Set per salt group by the V_HEAL switch (salts::VARIANT bit 4), or here for the simulator.
+/// 24: kills needed first (0 = none)   25: HP fraction below which it starts   26: mechs tracked
 pub(super) fn knob(i: usize) -> f32 {
-    static K: OnceLock<[f32; 15]> = OnceLock::new();
+    static K: OnceLock<[f32; 27]> = OnceLock::new();
     K.get_or_init(|| {
-        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.65, 0.5, 1.0];
+        let mut k = [1.0, 250.0, 0.0, 25.0, 1.0, 50.0, 1.0, 15.0, 25.0, 25.0, 0.0, 0.0, 0.65, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.35, 3.0]; // k[23] is 0: the per-group switch turns the rule on
         if let Ok(e) = std::env::var("PR_TUNE") {
-            for (j, x) in e.split(',').enumerate().take(15) {
+            for (j, x) in e.split(',').enumerate().take(27) {
                 k[j] = x.parse().unwrap_or(k[j]);
             }
         }
@@ -29,7 +35,7 @@ impl Bot {
     /// A weapon worth running for, as (score, (x, y), pickup id). In practice the hunters come to
     /// us whatever we do, so a laser picked up before the first fight is worth a long detour:
     /// in the simulator, matches where we never hold a laser score about 1.6 points lower.
-    pub(super) fn practice_weapon_goal(&self, me: &Me, t: f32, has_laser: bool, has_light: bool, in_bounds: &dyn Fn(&[f32]) -> bool) -> Option<(f32, (f32, f32), i64)> {
+    pub(super) fn practice_weapon_goal(&self, me: &Me, t: f32, has_laser: bool, has_light: bool, in_bounds: &dyn Fn(&[f32]) -> bool, hunt: bool) -> Option<(f32, (f32, f32), i64)> {
         if knob(0) < 0.5 {
             return None;
         }
@@ -56,7 +62,7 @@ impl Bot {
             }
             // Leave a weapon another mech is closer to. Insurance for a free-for-all mistaken for
             // practice (nobody dead yet at 8 s), where running past armed mechs loses duels.
-            if knob(6) > 0.5 && t < knob(8) && self.enemies.values().any(|e| t - e.seen < 6.0 && dxy(&e.pos, &it.pos) < d + knob(7)) {
+            if !hunt && knob(6) > 0.5 && t < knob(8) && self.enemies.values().any(|e| t - e.seen < 6.0 && dxy(&e.pos, &it.pos) < d + knob(7)) {
                 continue;
             }
             let score = d * pref + if roof { knob(3) } else { 0.0 };

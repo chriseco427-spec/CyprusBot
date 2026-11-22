@@ -432,6 +432,24 @@ fn flip_slack() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOFLIP").is_err())
 }
 
+/// Per-group practice switches (`salts::VARIANT`, one bit mask per salt group). All are practice
+/// (mode 1) only. `MB_VARIANT=n` overrides the mask for every group (simulator and self-test);
+/// the scorer sets no environment, so the masks in `salts.rs` are what runs there.
+const V_LHUNT: u8 = 1;
+const V_POLICY2: u8 = 2;
+const V_HEAL: u8 = 4;
+const V_RANGE100: u8 = 8;
+
+fn variant_env() -> Option<u8> {
+    static K: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_VARIANT").ok().and_then(|v| v.parse().ok()))
+}
+
+fn variant_log_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_VARLOG").is_ok())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -465,6 +483,8 @@ pub struct Bot {
     slot: i64,
     salted: bool,
     salt_group: i32,
+    variant: u8,
+    variant_seen: u8,
     rng_draws: u32,
     pickup_radius: f32,
     enemies: HashMap<i64, Enemy>,
@@ -620,6 +640,8 @@ impl Bot {
             slot: hello["slot"].as_i64().unwrap_or(-1),
             salted: false,
             salt_group: -1,
+            variant: 0,
+            variant_seen: 0,
             rng_draws: 0,
             pickup_radius: pr,
             enemies: HashMap::new(),
@@ -723,8 +745,20 @@ impl Bot {
         };
         let g = (key % salts::SALTS.len() as u64) as usize;
         self.salt_group = g as i32;
+        self.variant = variant_env().unwrap_or(salts::VARIANT[g]);
         self.rng = rng_seed(self.seed0, salts::SALTS[g]);
         eprintln!("salt group {} slot {} next centre {} draws before {}", g, self.slot, nc, self.rng_draws);
+    }
+
+    /// Is practice switch `bit` on for this match's salt group? Only in confirmed practice (mode 1).
+    /// With `MB_VARLOG` set, the first read that is on is logged to stderr (self-test).
+    fn vsw(&mut self, bit: u8) -> bool {
+        let on = self.mode == 1 && self.variant & bit != 0;
+        if on && variant_log_on() && self.variant_seen & bit == 0 {
+            self.variant_seen |= bit;
+            eprintln!("VARIANT bit {} read as on (group {}, mask {})", bit, self.salt_group, self.variant);
+        }
+        on
     }
 
     fn rand(&mut self) -> f32 {
@@ -1420,6 +1454,9 @@ impl Bot {
                 self.xf_t = -1.0;
                 self.xf_off = true;
             }
+            if (sure || crossfire2) && self.mode != 2 && std::env::var("MB_MODELOG").is_ok() {
+                eprintln!("MODE2 t={:.1} kills={} foreign_death={}", t, self.kills, foreign_death);
+            }
             if sure || crossfire2 {
                 self.mode = 2;
             } else if self.mode == 0 && t >= self.tune[9] {
@@ -1461,10 +1498,18 @@ impl Bot {
         let gun_s = slot_of("gun");
         let laser_s = slot_of("laser");
         let light_s = slot_of("lightning");
+        // Laser hunt (practice, `MB_LHUNT=1`): past 20 s or our first kill and still without a
+        // laser, getting one comes first. In simulated practice the matches that never hold a
+        // laser score 2.3 against 4.5, and in a quarter of them a laser we had seen was still on
+        // the ground: the 25 s zone rule turned us back 16 m short of one, a drone fight stopped a
+        // walk for 12 s, a mech standing next to us counted as "closer to it", and the swap from
+        // lightning waited for a quiet moment that never came.
+        let lhunt = self.vsw(V_LHUNT) && laser_s.is_none() && (self.kills >= 1 || t >= 20.0);
         let my_power = me.hp * (1.0 + 0.04 * me.cubes.min(10.0)) * if laser_s.is_some() { 1.3 } else { 1.0 };
         let power = |e: &Enemy| e.hp * (1.0 + 0.04 * e.cubes.min(10.0)) * if e.has("laser") { 1.3 } else { 1.0 };
         let threats: Vec<Enemy> = self.enemies.values().filter(|e| e.seen >= t - 0.01).cloned().collect();
         let any_hostile = threats.iter().any(|e| e.hostile_until > t);
+        let pol2 = self.vsw(V_POLICY2);
 
         // ---- target: best enemy we have a line of fire to
         let mut target: Option<Enemy> = None;
@@ -1520,7 +1565,7 @@ impl Bot {
                 let snow_veto = self.mode == 2 && snow_veto_on() && e.cubes >= 10.0 && t - e.hurt_me_t > 30.0 && e.hp >= 0.4 * e.max_hp && !busy_other;
                 (e.hostile_until > t && !snow_veto) || prey || ambush || committed || (alive <= 4 && my_power > 1.4 * power(e))
             } else {
-                match self.policy {
+                match if pol2 { 2 } else { self.policy } {
                     1 => e.hostile_until > t,
                     2 => e.hostile_until > t || (!any_hostile && hp_frac > 0.9),
                     _ => !p_lite || e.hostile_until > t,
@@ -1647,7 +1692,19 @@ impl Bot {
             }
             self.retreating = evade;
         } else if self.tune[3] < 0.5 {
-            self.retreating = false;
+            // Practice break-and-heal (switch V_HEAL, or PR_TUNE knob 23): badly hurt
+            // with enough hunters about (knob 26 tracked, 0 = any), break line of sight and
+            // regenerate instead of trading to the death. Kills gate knob 24 is 0 (always open).
+            let heal = (self.vsw(V_HEAL) || (self.mode == 1 && practice::knob(23) > 0.5)) && self.kills as f32 >= practice::knob(24);
+            let tracked = self.enemies.values().filter(|e| t - e.seen < 8.0).count() as f32;
+            if heal && !self.retreating && !finishable && hp_frac < practice::knob(25) && tracked >= practice::knob(26) {
+                self.retreating = true;
+                self.cover = None;
+            } else if heal && self.retreating && !(hp_frac >= 0.9 || (threats.is_empty() && hp_frac >= 0.7 && t - self.last_hurt_t > 6.0)) {
+                // keep healing
+            } else {
+                self.retreating = false;
+            }
         } else if !self.retreating {
             if !threats.is_empty() && !finishable && (hp_frac < self.tune[1] || (attackers >= 2 && hp_frac < self.tune[2])) {
                 self.retreating = true;
@@ -1697,7 +1754,7 @@ impl Bot {
                 if empty.is_some() {
                     take = p["id"].as_i64();
                 } else if let Some(w1) = &me.wpn[1] {
-                    let upgrade = (w1.kind == "mortar") || (self.tune[12] < 0.5 && w1.kind == "lightning" && kind == "laser" && (threats.is_empty() || self.practice_swap_ok(&me, &threats)));
+                    let upgrade = (w1.kind == "mortar") || (self.tune[12] < 0.5 && w1.kind == "lightning" && kind == "laser" && (threats.is_empty() || lhunt || self.practice_swap_ok(&me, &threats)));
                     if upgrade && w1.charge <= 0.0 {
                         take = p["id"].as_i64();
                         drop = Some(1);
@@ -1795,7 +1852,8 @@ impl Bot {
                 }
             }
         }
-        let practice_rush = if self.mode == 1 && !p_lite { self.practice_weapon_goal(&me, t, laser_s.is_some(), light_s.is_some(), &in_bounds) } else { None };
+        let hunt_bounds = |p: &[f32]| -> bool { in_bounds(p) || (lhunt && dxy(p, &z.c) < z.r - 8.0 && dxy(p, &me.pos) < 80.0) };
+        let practice_rush = if self.mode == 1 && !p_lite { self.practice_weapon_goal(&me, t, laser_s.is_some(), light_s.is_some(), &hunt_bounds, lhunt) } else { None };
 
         // A drone worth shooting: one that is hurting us, or any in reach when things are quiet.
         // Each is 350 HP for two cubes, and its own bullets are slow.
@@ -1987,7 +2045,7 @@ impl Bot {
                 Some(g) => Mv::Goto(g, me.energy > 30.0),
                 None => Mv::Goto(zone_point, false),
             };
-        } else if let (Some(n), true) = (shoot_npc, drone_hot || threats.is_empty()) {
+        } else if let (Some(n), true) = (shoot_npc, (drone_hot || threats.is_empty()) && !(lhunt && practice_rush.is_some())) {
             // Circle the drone at a distance where its slow bullets miss a moving mech.
             let to = [n.0[0] - here.0, n.0[1] - here.1];
             let d = to[0].hypot(to[1]).max(0.1);
@@ -2013,10 +2071,18 @@ impl Bot {
             let d = to[0].hypot(to[1]).max(0.1);
             let dir = [to[0] / d, to[1] / d];
             let mut range = self.tune[0];
+            // Practice (mode 1): stand off further, by weapon. Switch V_RANGE100 sets 100 m for
+            // gun and laser alike; PR_TUNE knobs 15 and 16 do the same in the simulator.
+            if self.mode == 1 {
+                let pr = if self.vsw(V_RANGE100) { 100.0 } else { practice::knob(if laser_s.is_some() { 16 } else { 15 }) };
+                if pr > 0.0 {
+                    range = pr;
+                }
+            }
             if light_s.is_some() && me.energy > 25.0 {
                 range = 30.0;
             } else if e.has("lightning") {
-                range = 65.0;
+                range = range.max(65.0);
             }
             let out = self.strafe_vec(here, me.pos[2], dir, d, range, t, &z);
             let burst = me.energy > 55.0 && (t * 1.3).sin() > 0.3;
@@ -2580,6 +2646,11 @@ impl Bot {
                 }
             }
         }
+        // Practice break-and-heal (knob 23): dealing damage also resets the regeneration clock, so
+        // hold fire while healing. Only this rule sets `retreating` in practice.
+        if self.retreating && (self.vsw(V_HEAL) || (self.mode == 1 && practice::knob(23) > 0.5)) {
+            fire = [false, false];
+        }
         // Reload in quiet moments.
         if let Some(s) = gun_s {
             let w = me.wpn[s].as_ref().unwrap();
@@ -2606,7 +2677,8 @@ impl Bot {
             for e in &threats {
                 es += &format!(" [d{:.0} hp{:.0} {}{}]", dxy(&e.pos, &me.pos), e.hp, if e.hostile_until > t { "H" } else { "n" }, if self.w.los(e.eye(), my_center) { "L" } else { "-" });
             }
-            self.dbg = format!("mode{} hp{:.0} {} retreat={} cover={:?} tgt={} fire={:?} thr:{}", self.mode, me.hp, mvk, self.retreating, self.cover.map(|c| (c.0 as i32, c.1 as i32)), target.is_some(), fire, es);
+            let lasers: Vec<String> = self.pickups.iter().filter(|(_, it)| it.kind == "laser").map(|(id, it)| format!("{}@{:.0}m{}{}", id, dxy(&it.pos, &me.pos), if self.blacklist.get(id).map_or(false, |u| t < *u) { "B" } else { "" }, if (it.pos[2] - self.w.surf_at(it.pos[0], it.pos[1])).abs() > 2.0 { "R" } else { "" })).collect();
+            self.dbg = format!("mode{} hp{:.0} {} retreat={} cover={:?} tgt={} fire={:?} w1={} pr={:?} plite={} L[{}] thr:{}", self.mode, me.hp, mvk, self.retreating, self.cover.map(|c| (c.0 as i32, c.1 as i32)), target.is_some(), fire, me.wpn[1].as_ref().map_or("-".to_string(), |w| w.kind.clone()), practice_rush.map(|c| (c.0 as i32, c.2)), p_lite, lasers.join(","), es);
         }
         let r3 = |x: f32| (x * 1000.0).round() / 1000.0;
         let mut a = Map::new();
