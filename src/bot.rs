@@ -572,9 +572,9 @@ const V_OPEN_OFF: u16 = 32768;
 /// 3 `PG_CUBE_STOP`: with ten cubes, no more walks to cubes, no crates, no drone farming.
 /// 4 `PG_HOLD_FOR_HUNTER`: holding a laser, a hunter coming at us from beyond 150 m: wait near
 ///   cover and let it come, charging as it enters range.
-const PG_DROP_REPAIR: bool = false;
-const PG_REST_AFTER5: bool = false;
-const PG_CUBE_STOP: bool = false;
+const PG_DROP_REPAIR: bool = true;
+const PG_REST_AFTER5: bool = true;
+const PG_CUBE_STOP: bool = true;
 const PG_HOLD_FOR_HUNTER: bool = false;
 /// Kills needed before PG_REST_AFTER5 acts (5; `MB_PGK` overrides it in the simulator).
 fn pg_kills() -> f32 {
