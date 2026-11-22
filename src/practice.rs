@@ -73,6 +73,89 @@ impl Bot {
         best
     }
 
+    /// Design B: the next errand between kills, in a fixed order: a laser when we hold none (out
+    /// to 250 m), any laser or lightning for an empty slot (150 m), cubes (90 m), the place a mech
+    /// died 3 to 30 s ago (130 m). Ground items only, nothing in the blacklist.
+    pub(super) fn practice_errand(&self, me: &Me, t: f32, has_laser: bool, in_bounds: &dyn Fn(&[f32]) -> bool) -> Option<(f32, (f32, f32), i64)> {
+        let ok = |id: &i64, pos: &[f32; 3]| -> bool {
+            !self.blacklist.get(id).map_or(false, |u| t < *u) && in_bounds(pos) && (pos[2] - self.w.surf_at(pos[0], pos[1])).abs() < 2.0 && pos[2] - me.pos[2] < 3.0
+        };
+        let nearest = |kinds: &[&str], reach: f32| -> Option<(f32, (f32, f32), i64)> {
+            let mut best: Option<(f32, (f32, f32), i64)> = None;
+            for (id, it) in &self.pickups {
+                if !kinds.contains(&it.kind.as_str()) || !ok(id, &it.pos) {
+                    continue;
+                }
+                let d = dxy(&it.pos, &me.pos);
+                if d <= reach && best.map_or(true, |b| d < b.0) {
+                    best = Some((d, (it.pos[0], it.pos[1]), *id));
+                }
+            }
+            best
+        };
+        if !has_laser {
+            if let Some(g) = nearest(&["laser"], 250.0) {
+                return Some(g);
+            }
+        }
+        if me.wpn[1].is_none() || me.wpn[0].is_none() {
+            if let Some(g) = nearest(&["laser", "lightning"], 150.0) {
+                return Some(g);
+            }
+        }
+        let mut best: Option<(f32, (f32, f32), i64)> = None;
+        for (id, it) in &self.cubes {
+            if self.blacklist.get(id).map_or(false, |u| t < *u) || !in_bounds(&it.pos) || (it.pos[2] - me.pos[2]).abs() > 5.0 {
+                continue;
+            }
+            let d = dxy(&it.pos, &me.pos);
+            if d <= 90.0 && best.map_or(true, |b| d < b.0) {
+                best = Some((d, (it.pos[0], it.pos[1]), *id));
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+        for x in &self.scav {
+            let age = t - x.1;
+            let p3 = [x.0[0], x.0[1], me.pos[2]];
+            let d = dxy(&p3, &me.pos);
+            if age < 3.0 || age > 30.0 || d < 10.0 || d > 130.0 || !in_bounds(&p3) || !self.w.free_at(x.0[0], x.0[1]) {
+                continue;
+            }
+            if best.map_or(true, |b| d < b.0) {
+                best = Some((d, (x.0[0], x.0[1]), -2));
+            }
+        }
+        best
+    }
+
+    /// PG_DROP_REPAIR: a supply drop worth breaking off for, as its position: HP below 80%, within
+    /// 200 m and inside the zone, landing about when we can get there (or landed), and not one
+    /// somebody else is already capturing.
+    pub(super) fn pg_drop_goal(&self, me: &Me, t: f32, obs: &serde_json::Value, in_bounds: &dyn Fn(&[f32]) -> bool) -> Option<(f32, f32)> {
+        if me.hp / me.max_hp.max(1.0) >= 0.80 {
+            return None;
+        }
+        let my_id = obs["self"]["id"].as_i64().unwrap_or(-1);
+        let _ = t;
+        let mut best: Option<(f32, (f32, f32))> = None;
+        for d in obs["drops"].as_array()? {
+            let p = [d["pos"][0].as_f64()? as f32, d["pos"][1].as_f64()? as f32, d["pos"][2].as_f64().unwrap_or(0.0) as f32];
+            let dist = dxy(&p, &me.pos);
+            let lands_in = d["lands_in"].as_f64().unwrap_or(99.0) as f32;
+            let holder = d["holder"].as_i64();
+            let theirs = holder.map_or(false, |h| h != my_id) && d["progress"].as_f64().unwrap_or(0.0) > 0.0;
+            if theirs || dist > 200.0 || !in_bounds(&p) || lands_in > dist / me.walk.max(1.0) + 3.0 {
+                continue;
+            }
+            if best.map_or(true, |b| dist < b.0) {
+                best = Some((dist, (p[0], p[1])));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
     /// Practice only: drop lightning for a laser when no enemy is close enough to punish the
     /// 1.65 s the new laser needs before it can fire.
     pub(super) fn practice_swap_ok(&self, me: &Me, threats: &[Enemy]) -> bool {
