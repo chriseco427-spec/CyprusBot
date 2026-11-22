@@ -316,6 +316,26 @@ pub(crate) fn finish_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOFINISH").is_err())
 }
 
+/// Hold range in a fight we started (confirmed free-for-all only). On by default;
+/// `MB_NOHOLDRANGE=1` switches it off.
+fn hold_range_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOHOLDRANGE").is_err())
+}
+
+/// Leave a gun fight against a laser holder that hit us first (confirmed free-for-all only).
+/// On by default; `MB_NOLEAVE=1` switches it off.
+fn leave_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOLEAVE").is_err())
+}
+
+/// Test log of fights on stderr (`MB_FIGHTLOG=1`); changes no decision.
+fn fight_log() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_FIGHTLOG").is_ok())
+}
+
 /// `MB_XF2=sectors,seconds` (0 sectors = off, the default).
 fn crossfire2() -> (usize, f32) {
     static K: std::sync::OnceLock<(usize, f32)> = std::sync::OnceLock::new();
@@ -447,6 +467,23 @@ const V_RANGE150: u16 = 64;
 const V_FOLLOW55: u16 = 128;
 const V_SHAREDUP: u16 = 256;
 const V_HEAL_ANY: u16 = 512;
+/// Regroup in the lulls: hurt, nobody has had a line on us for 3 s and nothing is hitting us:
+/// go to cover and hold all fire until HP is back to 90% or a mech shows up.
+const V_REGROUP: u16 = 1024;
+/// Straight, boosted run to the nearest special weapon from the first second (modes 0 and 1:
+/// it acts before the match type is known, so it also plays in free-for-alls of that group).
+const V_RUN0: u16 = 2048;
+/// Practice opening: wait for the first hunter at a low-exposure spot, not on a random walk.
+const V_COVERSPOT: u16 = 4096;
+/// Sidestep timing: reversal floor of the bullet's flight time, one reversal on a laser charge
+/// aimed at us, no jump under fire.
+const V_SIDESTEP: u16 = 8192;
+/// Eager farming: crates and lone drones are shot whenever no hunter is in view, from 40% HP.
+const V_EAGER: u16 = 16384;
+/// Opening safety off (modes 0 and 1 only): no break-away after a laser hit from range and no limit on
+/// weapon walks across open streets before the match type is known; the practice play of the builds
+/// before the opening-safety commit. Never acts in confirmed free-for-all.
+const V_OPEN_OFF: u16 = 32768;
 
 fn variant_env() -> Option<u16> {
     static K: std::sync::OnceLock<Option<u16>> = std::sync::OnceLock::new();
@@ -493,6 +530,13 @@ pub struct Bot {
     salt_group: i32,
     variant: u16,
     variant_seen: std::cell::Cell<u16>,
+    regroup: bool,
+    watched_t: f32,
+    run0_id: i64,
+    run0_t0: f32,
+    side_id: i64,
+    side_t: f32,
+    strafe_floor: f32,
     rng_draws: u32,
     pickup_radius: f32,
     enemies: HashMap<i64, Enemy>,
@@ -560,6 +604,18 @@ pub struct Bot {
     /// The laser carrier we are closing on with lightning, and until when.
     arc_id: i64,
     arc_until: f32,
+    /// The mech we opened fire on (it had not hit us in the 30 s before we took aim), and until
+    /// when the fight counts as one we started. Tracked in a confirmed free-for-all only.
+    open_id: i64,
+    open_until: f32,
+    /// Laser holders that hit us first while we held only the gun, and when: no fight with them
+    /// until we hold a laser or lightning, or they are wounded. Confirmed free-for-all only.
+    shun: HashMap<i64, f32>,
+    /// Test log (MB_FIGHTLOG): kind (0 fight we started, 1 hit first), mech, start time, whether
+    /// the 5 s line is written, where we stood and the direction to the mech then; and a key that
+    /// tells runs apart.
+    flog: Vec<(u8, i64, f32, bool, [f32; 2], [f32; 2])>,
+    flog_key: String,
     /// The target we have had a continuous line of fire to, since when, and when last.
     los_id: i64,
     los_since: f32,
@@ -650,6 +706,13 @@ impl Bot {
             salt_group: -1,
             variant: 0,
             variant_seen: std::cell::Cell::new(0),
+            regroup: false,
+            watched_t: -100.0,
+            run0_id: -1,
+            run0_t0: -100.0,
+            side_id: -1,
+            side_t: -100.0,
+            strafe_floor: 0.0,
             rng_draws: 0,
             pickup_radius: pr,
             enemies: HashMap::new(),
@@ -706,6 +769,11 @@ impl Bot {
             commit_until: -1.0,
             arc_id: -1,
             arc_until: -1.0,
+            open_id: -1,
+            open_until: -1.0,
+            shun: HashMap::new(),
+            flog: Vec::new(),
+            flog_key: String::new(),
             los_id: -1,
             los_since: 0.0,
             los_last: -100.0,
@@ -761,7 +829,17 @@ impl Bot {
     /// Is practice switch `bit` on for this match's salt group? Only in confirmed practice (mode 1).
     /// With `MB_VARLOG` set, the first read that is on is logged to stderr (self-test).
     fn vsw(&self, bit: u16) -> bool {
-        let on = self.mode == 1 && self.variant & bit != 0;
+        self.vgate(bit, self.mode == 1)
+    }
+
+    /// Opening safety (see `opening_safe_on`) unless the group switched it off with V_OPEN_OFF.
+    pub(crate) fn open_safe(&self) -> bool {
+        opening_safe_on() && !self.vgate(V_OPEN_OFF, self.mode != 2)
+    }
+
+    /// Same, with the caller deciding which modes the switch may act in (`ok`).
+    fn vgate(&self, bit: u16, ok: bool) -> bool {
+        let on = ok && self.variant & bit != 0;
         if on && variant_log_on() && self.variant_seen.get() & bit == 0 {
             self.variant_seen.set(self.variant_seen.get() | bit);
             eprintln!("VARIANT bit {} read as on (group {}, mask {})", bit, self.salt_group, self.variant);
@@ -1137,7 +1215,7 @@ impl Bot {
             if self.rand() < 0.85 {
                 self.strafe_dir = -self.strafe_dir;
             }
-            self.strafe_until = t + self.tune[6] + self.tune[7] * self.rand();
+            self.strafe_until = t + (self.tune[6] + self.tune[7] * self.rand()).max(self.strafe_floor);
         }
         let radial = ((d - range) / 20.0).clamp(-1.0, 1.0) * 0.8;
         let sd = self.strafe_dir;
@@ -1197,6 +1275,9 @@ impl Bot {
         let t = f(&obs["t"]);
         self.fd_cand.clear();
         let me = Self::parse_me(&obs["self"]);
+        if fight_log() && self.flog_key.is_empty() {
+            self.flog_key = format!("{:.0},{:.0}", me.pos[0], me.pos[1]);
+        }
         let here = (me.pos[0], me.pos[1]);
         let muzzle = [me.pos[0], me.pos[1], me.pos[2] + me.muzzle_h];
         let my_center = [me.pos[0], me.pos[1], me.pos[2] + 0.5 * me.height];
@@ -1261,6 +1342,17 @@ impl Bot {
                 }
                 if e["type"].as_str() == Some("hit") {
                     if let Some(id) = e["target"].as_i64() {
+                        if fight_log() && self.mode == 2 && self.my_hit_t.get(&id).map_or(true, |h| t - *h > 30.0) {
+                            if let Some(en) = self.enemies.get(&id) {
+                                if t - en.hurt_me_t > 30.0 {
+                                    let has = |k: &str| me.wpn.iter().any(|w| w.as_ref().map_or(false, |w| w.kind == k));
+                                    let w = if has("laser") { "laser" } else if has("lightning") { "lightning" } else { "gun" };
+                                    let d = dxy(&en.pos, &me.pos);
+                                    eprintln!("FIGHT OPEN {} {} {:.1} d={:.0} hp={:.2} thp={:.2} w={} tl={}", self.flog_key, id, t, d, me.hp / me.max_hp.max(1.0), en.hp / en.max_hp.max(1.0), w, en.has("laser") as u8);
+                                    self.flog.push((0, id, t, false, [me.pos[0], me.pos[1]], [(en.pos[0] - me.pos[0]) / d.max(1.0), (en.pos[1] - me.pos[1]) / d.max(1.0)]));
+                                }
+                            }
+                        }
                         self.my_hit_t.insert(id, t);
                         if !self.i_hit.contains(&id) {
                             self.i_hit.push(id);
@@ -1302,6 +1394,28 @@ impl Bot {
                             if ((laser && d > 60.0) || counter) && t >= self.brk_until {
                                 self.brk_id = by;
                                 self.brk_until = t + fx(13);
+                            }
+                            // Hit first by a laser holder while we hold only the gun. In our
+                            // recorded early deaths 18 of 21 came while trading fire, 13 of the
+                            // killers held a laser, and we were gun-only at the first hit 60% of
+                            // the time. Confirmed free-for-all: break line of sight from 40 m out
+                            // (inside that we are cornered and fight), and stay out of that fight
+                            // until we hold a laser or lightning or the attacker is wounded.
+                            let gun_only = !me.wpn.iter().any(|w| w.as_ref().map_or(false, |w| w.kind == "laser" || w.kind == "lightning"));
+                            let ours = self.my_hit_t.get(&by).map_or(false, |h| t - *h < 30.0) || (by == self.open_id && t < self.open_until);
+                            if en.has("laser") && gun_only && !ours && t - en.hurt_me_t > 30.0 {
+                                let on = self.mode == 2 && leave_on();
+                                if fight_log() {
+                                    eprintln!("FIGHT HITFIRST {} {} {:.1} d={:.0} mode={} on={} hp={:.2}", self.flog_key, by, t, d, self.mode, on as u8, me.hp / me.max_hp.max(1.0));
+                                    self.flog.push((1, by, t, true, [me.pos[0], me.pos[1]], [0.0, 0.0]));
+                                }
+                                if on {
+                                    self.shun.insert(by, t);
+                                    if d > 40.0 && t >= self.brk_until {
+                                        self.brk_id = by;
+                                        self.brk_until = t + fx(13);
+                                    }
+                                }
                             }
                         }
                         if let Some(en) = self.enemies.get_mut(&by) {
@@ -1532,6 +1646,14 @@ impl Bot {
         let threats: Vec<Enemy> = self.enemies.values().filter(|e| e.seen >= t - 0.01).cloned().collect();
         let any_hostile = threats.iter().any(|e| e.hostile_until > t);
         let pol2 = self.vsw(V_POLICY2);
+        if !self.shun.is_empty() {
+            if laser_s.is_some() || light_s.is_some() {
+                self.shun.clear();
+            } else {
+                let en = &self.enemies;
+                self.shun.retain(|id, _| en.get(id).map_or(false, |e| t - e.seen < 45.0 && e.hp >= 0.4 * e.max_hp));
+            }
+        }
 
         // ---- target: best enemy we have a line of fire to
         let mut target: Option<Enemy> = None;
@@ -1578,14 +1700,17 @@ impl Bot {
                     self.commit_id = e.id;
                     self.commit_until = t + 10.0;
                 }
-                let committed = e.id == self.commit_id && t < self.commit_until && hp_frac > 0.4;
+                // A laser holder that hit us first while we hold only the gun: we do not start
+                // that fight again (see `shun`).
+                let shunned = self.mode == 2 && leave_on() && self.shun.contains_key(&e.id);
+                let committed = e.id == self.commit_id && t < self.commit_until && hp_frac > 0.4 && !shunned;
                 // Snowballer (10+ cubes, private/COUNTERS.md #2): one that has only looked our way
                 // is not worth opening on. When we hit one first we die 31-41% of the time and kill
                 // it 21-35%. Shoot back once it hits us, or open when it is aiming at someone else
                 // or is below 40% HP.
                 let busy_other = threats.iter().any(|o| o.id != e.id && dxy(&o.pos, &e.pos) < 220.0 && wrap(aim_to(e.eye(), o.center())[0] - e.aim[0]).abs() < 0.25);
                 let snow_veto = self.mode == 2 && snow_veto_on() && e.cubes >= 10.0 && t - e.hurt_me_t > 30.0 && e.hp >= 0.4 * e.max_hp && !busy_other;
-                (e.hostile_until > t && !snow_veto) || prey || ambush || committed || (alive <= 4 && my_power > 1.4 * power(e))
+                (e.hostile_until > t && !snow_veto) || prey || ambush || committed || (alive <= 4 && my_power > 1.4 * power(e) && !shunned)
             } else {
                 match if pol2 { 2 } else { self.policy } {
                     1 => e.hostile_until > t,
@@ -1613,6 +1738,38 @@ impl Bot {
                 self.los_since = t;
             }
             self.los_last = t;
+        }
+        // A fight we start (confirmed free-for-all): the target had not hit us in the 30 s before
+        // we took aim at it. It stays ours while we keep aiming at it.
+        if self.mode == 2 {
+            if let Some(e) = &target {
+                if e.id == self.open_id && t < self.open_until {
+                    self.open_until = t + 10.0;
+                } else if t - e.hurt_me_t > 30.0 {
+                    self.open_id = e.id;
+                    self.open_until = t + 10.0;
+                }
+            }
+        }
+        if fight_log() {
+            let key = self.flog_key.clone();
+            let en = &self.enemies;
+            for r in self.flog.iter_mut() {
+                if r.0 == 0 && !r.3 && t >= r.2 + 5.0 {
+                    r.3 = true;
+                    // own = how fast we ourselves moved toward where the mech stood (m/s).
+                    let own = ((me.pos[0] - r.4[0]) * r.5[0] + (me.pos[1] - r.4[1]) * r.5[1]) / (t - r.2).max(0.1);
+                    if let Some(e) = en.get(&r.1) {
+                        if t - e.seen < 1.0 {
+                            eprintln!("FIGHT D5 {} {} {:.1} d={:.0} own={:.1}", key, r.1, r.2, dxy(&e.pos, &me.pos), own);
+                        }
+                    }
+                }
+                if t >= r.2 + 20.0 {
+                    eprintln!("FIGHT {} {} {} {:.1}", if r.0 == 0 { "ALIVE" } else { "HALIVE" }, key, r.1, r.2);
+                }
+            }
+            self.flog.retain(|r| t < r.2 + 20.0);
         }
 
         // ---- stand or run. Against the house squad nobody else thins the field, so running only
@@ -1698,8 +1855,11 @@ impl Bot {
                         // line of fire unless it is nearly dead.
                         let dh = dxy(&hostiles[0].pos, &me.pos);
                         let no_trade = self.mode == 2 && last4_on() && alive <= 4 && laser_s.is_none() && hostiles[0].has("laser") && dh > 50.0 && dh < 120.0;
+                        let shunned = self.mode == 2 && leave_on() && self.shun.contains_key(&hostiles[0].id);
                         if no_trade {
                             wounded || finishable
+                        } else if shunned {
+                            finishable
                         } else {
                             committed || wounded || my_power >= (if self.mode == 0 { self.tune[11] } else { self.tune[8] }) * power(hostiles[0]) || finishable
                         }
@@ -1727,6 +1887,28 @@ impl Bot {
                 // keep healing
             } else {
                 self.retreating = false;
+            }
+            // Regroup in the lulls (V_REGROUP): never leaves a fight (it starts only with nothing in
+            // view) and ends the moment a mech shows up or hits us.
+            if self.vsw(V_REGROUP) {
+                if self.enemies.values().any(|e| t - e.seen < 5.0 && self.w.los(e.eye(), my_center)) {
+                    self.watched_t = t;
+                }
+                if !self.regroup && hp_frac < 0.6 && threats.is_empty() && t - self.last_hurt_t > 2.0 && t - self.watched_t > 3.0 && !finishable {
+                    self.regroup = true;
+                    self.cover = None;
+                } else if self.regroup && (hp_frac >= 0.9 || !threats.is_empty() || t - self.last_hurt_t < 1.0) {
+                    self.regroup = false;
+                }
+                if self.regroup {
+                    self.retreating = true;
+                    // Cover from where mechs were last seen, not only from those in view now.
+                    for e in self.enemies.values().filter(|e| t - e.seen < 10.0 && e.seen < t - 0.01) {
+                        evade_from.push(e.clone());
+                    }
+                }
+            } else {
+                self.regroup = false;
             }
         } else if !self.retreating {
             if !threats.is_empty() && !finishable && (hp_frac < self.tune[1] || (attackers >= 2 && hp_frac < self.tune[2])) {
@@ -1878,6 +2060,42 @@ impl Bot {
         let hunt_bounds = |p: &[f32]| -> bool { in_bounds(p) || (lhunt && dxy(p, &z.c) < z.r - 8.0 && dxy(p, &me.pos) < 80.0) };
         let practice_rush = if self.mode == 1 && !p_lite { self.practice_weapon_goal(&me, t, laser_s.is_some(), light_s.is_some(), &hunt_bounds, lhunt) } else { None };
 
+        // Weapon run from second 0 (V_RUN0): gun only, head straight for the nearest laser we know
+        // of (lightning when no laser is), boosting while the tank is above 40. Gives up on one pickup
+        // after 12 s and ignores it for 30 s, and while a mech is hitting us.
+        let mut run0: Option<(f32, (f32, f32), i64)> = None;
+        if self.vgate(V_RUN0, self.mode != 2) && me.wpn[1].is_none() && !self.retreating && t - self.last_hurt_t > 3.0 {
+            for (id, it) in &self.pickups {
+                let reach = match it.kind.as_str() {
+                    "laser" => practice::knob(1),
+                    "lightning" => 130.0,
+                    _ => continue,
+                };
+                let d = dxy(&it.pos, &me.pos);
+                if self.blacklist.get(id).map_or(false, |u| t < *u) || d > reach || it.pos[2] - me.pos[2] > 3.0 || !in_bounds(&it.pos) || (it.pos[2] - self.w.surf_at(it.pos[0], it.pos[1])).abs() > 2.0 {
+                    continue;
+                }
+                if self.drop_avoid.iter().any(|q| (q[0] - it.pos[0]).hypot(q[1] - it.pos[1]) < 60.0) {
+                    continue;
+                }
+                // Lasers first: a lightning pickup is only worth it when no laser qualifies.
+                let score = d + if it.kind == "laser" { 0.0 } else { 1000.0 };
+                if run0.map_or(true, |r| score < r.0) {
+                    run0 = Some((score, (it.pos[0], it.pos[1]), *id));
+                }
+            }
+            if let Some(r) = run0 {
+                if r.2 != self.run0_id {
+                    self.run0_id = r.2;
+                    self.run0_t0 = t;
+                }
+                if t - self.run0_t0 > 12.0 {
+                    self.blacklist.insert(r.2, t + 30.0);
+                    run0 = None;
+                }
+            }
+        }
+
         // A drone worth shooting: one that is hurting us, or any in reach when things are quiet.
         // Each is 350 HP for two cubes, and its own bullets are slow.
         let quiet = threats.is_empty() && (!cautious || self.enemies.values().all(|e| t - e.seen > 8.0));
@@ -1893,7 +2111,9 @@ impl Bot {
         // Low on HP next to one drone (free-for-all): no branch below covered it, so we held still
         // and let a lone drone finish us at 5 AM. Walk out of its reach instead.
         let drone_flee = drone_hot && (drones_near >= 2 || (self.mode == 2 && hp_frac <= 0.2));
-        let farm_drone = self.tune[15] < 0.5 && drones_near <= 1 && target.is_none() && hp_frac > 0.75 && quiet && t >= 25.0;
+        let eager = self.vsw(V_EAGER) && hp_frac > 0.4;
+        let cover_open_on = self.vsw(V_COVERSPOT) && self.kills == 0;
+        let farm_drone = self.tune[15] < 0.5 && drones_near <= 1 && target.is_none() && ((hp_frac > 0.75 && t >= 25.0) || eager) && quiet;
         if !drone_flee && ((drone_hot && drones_near == 1 && hp_frac > 0.2) || farm_drone) {
             let mut bd = 85.0;
             for n in &npcs {
@@ -2023,6 +2243,17 @@ impl Bot {
             }
         }
         let cover_mv = self.cover_move(&me, t, &threats, &z, my_center, laser_s.is_some(), light_s.is_some(), &in_bounds);
+        // Hold range in a fight we started (confirmed free-for-all). In our recorded showdown
+        // matches we opened from a median 132 m while closing at 5.8 m/s, and a quarter of those
+        // fights ended in our death although our damage ratio in them was fine: the cost is the
+        // walk in. So close at about 1 m/s at most, and take no loot that brings us more than
+        // 5 m nearer, unless the target is below 40% HP (the lightning rush on a laser holder is
+        // a separate branch).
+        let hold_tgt: Option<[f32; 3]> = match &target {
+            Some(e) if self.mode == 2 && hold_range_on() && e.id == self.open_id && t < self.open_until && e.hp >= 0.4 * e.max_hp => Some(e.pos),
+            _ => None,
+        };
+        let closes_in = |g: (f32, f32)| hold_tgt.map_or(false, |p| (p[0] - g.0).hypot(p[1] - g.1) < dxy(&p, &me.pos) - 5.0);
         if t < self.unstick_until {
             mv = Mv::Direct([self.unstick_dir.cos(), self.unstick_dir.sin()], true);
         } else if zone_urgent {
@@ -2040,6 +2271,9 @@ impl Bot {
             mv = cm;
         } else if let Some(pm) = peek_mv {
             mv = pm;
+        } else if let (Some(r), false) = (run0, cornered) {
+            goal_id = Some(r.2);
+            mv = Mv::Goto(r.1, me.energy > 40.0);
         } else if let (Some(r), false) = (ffa_rush, cornered) {
             goal_id = Some(r.2);
             // On foot in the opening unless it is right here: boosting from second 1 left us at
@@ -2081,10 +2315,10 @@ impl Bot {
         } else if let (Some(c), true) = (practice_rush, !self.retreating) {
             goal_id = Some(c.2);
             mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
-        } else if let (Some(c), true) = (near_gun, !threats.is_empty() && !self.retreating && !(self.mode == 2 && wounded_hold_on() && hp_frac < 0.6 && near_gun.map_or(false, |c| c.0 > 20.0))) {
+        } else if let (Some(c), true) = (near_gun, !threats.is_empty() && !self.retreating && !(self.mode == 2 && wounded_hold_on() && hp_frac < 0.6 && near_gun.map_or(false, |c| c.0 > 20.0)) && !near_gun.map_or(false, |c| closes_in(c.1))) {
             goal_id = Some(c.2);
             mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
-        } else if let (Some(c), true) = (near_cube, !threats.is_empty() && !self.retreating && !(self.mode == 2 && wounded_hold_on() && hp_frac < 0.6 && near_cube.map_or(false, |c| c.0 > 20.0))) {
+        } else if let (Some(c), true) = (near_cube, !threats.is_empty() && !self.retreating && !(self.mode == 2 && wounded_hold_on() && hp_frac < 0.6 && near_cube.map_or(false, |c| c.0 > 20.0)) && !near_cube.map_or(false, |c| closes_in(c.1))) {
             // Fighting or stalking with a cube in reach: collect it while we shoot.
             goal_id = Some(c.2);
             mv = Mv::Goto(c.1, me.energy > 30.0 && c.0 > 15.0);
@@ -2113,9 +2347,32 @@ impl Bot {
             } else if e.has("lightning") {
                 range = range.max(65.0);
             }
+            // Sidestep timing (V_SIDESTEP): no reversal sooner than the bullet's flight time over
+            // this distance (252 m/s), and one reversal, held for a second, when a laser that is
+            // aimed at us starts to charge.
+            let side = self.vsw(V_SIDESTEP);
+            if side {
+                let lc = threats.iter().find(|o| o.has("laser") && o.charging && wrap(aim_to(o.eye(), my_center)[0] - o.aim[0]).abs() < 0.12).map(|o| o.id);
+                if let Some(id) = lc {
+                    if id != self.side_id || t - self.side_t > 2.0 {
+                        self.strafe_dir = -self.strafe_dir;
+                        self.strafe_until = self.strafe_until.max(t + 1.0);
+                        self.side_id = id;
+                        self.side_t = t;
+                    }
+                }
+                self.strafe_floor = d / 252.0;
+            }
+            if hold_tgt.is_some() {
+                range = range.max(d - 2.0);
+            }
             let out = self.strafe_vec(here, me.pos[2], dir, d, range, t, &z);
+            self.strafe_floor = 0.0;
             let burst = me.energy > 55.0 && (t * 1.3).sin() > 0.3;
-            mv = Mv::Direct(out, burst);
+            // First hunter from cover (V_COVERSPOT): at the waiting spot, with the hunter still
+            // far off, stay put and shoot from there.
+            let hold_cover = cover_open_on && d > 45.0 && self.hide_arrived >= 0.0 && self.hide.map_or(false, |h| dxy(&[h.0, h.1, 0.0], &me.pos) < 6.0);
+            mv = if hold_cover { Mv::Hold } else { Mv::Direct(out, burst) };
         } else if let Some(g) = if self.mode == 1 && target.is_none() { self.practice_finish_goal(&me, t) } else { None } {
             // Practice: follow up a wounded hunter that broke off.
             mv = Mv::Goto(g, me.energy > 40.0);
@@ -2136,6 +2393,7 @@ impl Bot {
             let (wref, lim) = (&*self.w, self.cover_lim);
             let danger = |p: &[f32; 3]| cautious && (en.values().any(|e| t - e.seen < 12.0 && dxy(&e.pos, p) < 90.0) || da.iter().any(|q| (q[0] - p[0]).hypot(q[1] - p[1]) < 60.0));
             let calm = !cautious || en.values().all(|e| t - e.seen > 8.0);
+            let cover_open = cover_open_on;
             // Free-for-all, badly hurt: regenerate where we are rather than walk out for loot (9 AM:
             // killed at 21% HP in the open right after a kill).
             let lie_low = self.mode == 2 && wounded_hold_on() && hp_frac < 0.6;
@@ -2190,7 +2448,7 @@ impl Bot {
                     || (!slot_free && want_laser && it.kind == "laser" && light_s.is_some());
                 // Opening (match type not known yet, or practice still guarded): no walk to a weapon
                 // across open streets. 10 AM: hit at 6 s on a walk to a weapon 71 m away in the open.
-                let opening = opening_safe_on() && (self.mode == 0 || p_lite);
+                let opening = (self.mode == 0 || p_lite) && self.open_safe();
                 let d_it = dxy(&it.pos, &me.pos);
                 if opening && d_it > 25.0 && self.open_run(here, (it.pos[0], it.pos[1])) > 40.0 {
                     continue;
@@ -2200,7 +2458,7 @@ impl Bot {
                     consider(dxy(&it.pos, &me.pos) * pref, &it.pos, *id, &mut goal);
                 }
             }
-            if hp_frac > 0.85 && calm && (!cautious || t >= self.tune[18]) {
+            if (hp_frac > 0.85 || eager) && calm && (!cautious || t >= self.tune[18]) {
                 for (id, it) in &self.crates {
                     if in_bounds(&it.pos) && !danger(&it.pos) && (!cautious || it.pos[2] - me.pos[2] <= 3.0) {
                         consider(dxy(&it.pos, &me.pos) * 1.0 + 10.0, &it.pos, *id, &mut goal);
@@ -2257,7 +2515,7 @@ impl Bot {
                 None => {
                     if !inside_next {
                         mv = Mv::Goto(zone_point, false);
-                    } else if cautious {
+                    } else if cautious || cover_open {
                         // Nothing to collect: wait in an enclosed spot, and hop to a new one now and
                         // then so we see more of the map.
                         let stale = match self.hide {
@@ -2267,7 +2525,7 @@ impl Bot {
                                 // (9 AM: stepped back into view at 56% HP and died in 1.9 s).
                                 let hop = if self.mode == 2 && wounded_hold_on() && hp_frac < 0.9 {
                                     f32::INFINITY
-                                } else if self.mode == 2 && hide_table_on() {
+                                } else if (self.mode == 2 || cover_open) && hide_table_on() {
                                     hide_knob(1)
                                 } else {
                                     self.tune[17]
@@ -2281,7 +2539,7 @@ impl Bot {
                             // Confirmed free-for-all: go by where recorded mechs actually walk and
                             // look. The enclosed-nook rule below picked spots about five times
                             // more exposed than the best one in reach.
-                            let by_table = if self.mode == 2 && hide_table_on() { self.pick_hide_risk(&me, &z, t, hide_knob(2)) } else { None };
+                            let by_table = if (self.mode == 2 || cover_open) && hide_table_on() { self.pick_hide_risk(&me, &z, t, hide_knob(2)) } else { None };
                             self.hide = by_table.or_else(|| self.pick_hide(&me, &z, t, if first { 0.0 } else { 40.0 }, if first { 60.0 } else { 110.0 }));
                             self.hide_t = t;
                             self.hide_arrived = -1.0;
@@ -2479,7 +2737,7 @@ impl Bot {
             }
         }
         self.avoid.retain(|a| t < a.1);
-        if (self.mode != 1 || p_lite) && t < fx(5) && me.energy < fx(6) && me.in_zone && !self.enemies.values().any(|e| t - e.hurt_me_t < 3.0) {
+        if (self.mode != 1 || p_lite) && run0.is_none() && t < fx(5) && me.energy < fx(6) && me.in_zone && !self.enemies.values().any(|e| t - e.hurt_me_t < 3.0) {
             // Opening: keep the tank for breaking line of sight. Boost only to escape a mech that
             // is hitting us.
             boost = false;
@@ -2677,7 +2935,7 @@ impl Bot {
         }
         // Practice break-and-heal (knob 23): dealing damage also resets the regeneration clock, so
         // hold fire while healing. Only this rule sets `retreating` in practice.
-        if self.retreating && self.heal_on() {
+        if self.retreating && (self.heal_on() || (self.regroup && self.vsw(V_REGROUP))) {
             fire = [false, false];
         }
         // Reload in quiet moments.
@@ -2714,6 +2972,9 @@ impl Bot {
         a.insert("tick".into(), obs["tick"].clone());
         a.insert("move".into(), json!([r3(mvec[0]), r3(mvec[1])]));
         a.insert("boost".into(), json!(boost));
+        if jump && target.is_some() && t - self.last_hurt_t < 2.0 && self.vsw(V_SIDESTEP) {
+            jump = false; // a mech in the air cannot change direction
+        }
         a.insert("jump".into(), json!(jump));
         a.insert("aim".into(), json!([r3(aim[0]), r3(aim[1])]));
         a.insert("fire".into(), json!(fire));

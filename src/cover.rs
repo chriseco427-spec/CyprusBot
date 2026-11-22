@@ -87,7 +87,7 @@ impl Bot {
         // against 70 to 89% for those that stayed in it.
         // Also in the opening, before the match type is known (or while practice is still guarded):
         // 10 AM, hit first at 10 s from 176 m in the open and dead at 17 s.
-        let opening = super::opening_safe_on() && (self.mode == 0 || (self.mode == 1 && self.kills == 0 && t < self.p_lite_t()));
+        let opening = (self.mode == 0 || (self.mode == 1 && self.kills == 0 && t < self.p_lite_t())) && self.open_safe();
         let brk_on = (ffa_only && fx(10) > 0.5) || ((self.mode == 2 || opening) && std::env::var("MB_NOBRK").is_err());
         if brk_on && t < self.brk_until {
             if let Some(e) = self.enemies.get(&self.brk_id).cloned() {

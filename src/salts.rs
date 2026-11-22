@@ -20,6 +20,14 @@
 //! 128: follow up a wounded hunter below 55% HP instead of 65%
 //! 256: shared upgrade order instead of offense-first
 //! 512: retreat and heal with any number of hunters tracked (wins over 4)
+//! 1024: regroup in the lulls (hurt below 60%, unseen for 3 s: cover, hold fire until 90%)
+//! 2048: straight boosted run to the nearest special weapon from second 0 (acts before the match
+//!       type is known, so it also plays in free-for-alls of that group)
+//! 4096: first hunter from cover (wait at a low-exposure spot until our first kill)
+//! 8192: sidestep timing (reversals no sooner than the bullet's flight time, one on a laser charge)
+//! 16384: eager farming (crates and lone drones whenever no hunter is in view, from 40% HP)
+//! 32768: opening safety off (modes 0 and 1: no break-away after a laser hit from range, no limit on
+//!        weapon walks across open street; the practice play of the builds before that commit)
 //! Bits add up (5 = laser hunt and heal). Change one entry per submission.
 
 pub const SALTS: [u64; 32] = [3,1002,4,4,4,4,4,3, 3,1002,4,4,3,4,4,3, 3,1002,4,4,3,4,4,3, 3,1002,4,4,3,4,4,3];
