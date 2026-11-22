@@ -1,6 +1,6 @@
 //! Practice: per-match-group RNG salts and practice settings, selected by submission testing.
 //!
-//! On its first observation the bot puts the match in one of 8 groups (from its slot and the first
+//! On its first observation the bot puts the match in one of 32 groups (VARIANT is per 8-group: g % 8) (from its slot and the first
 //! next-circle centre, see `Bot::apply_salt`) and seeds its random choices with that group's salt.
 //! A salt only reshuffles strafe timing, wander points and unstick directions. Every entry equal
 //! to 3 plays exactly like the single `RNG_SALT = 3` build (f0a08f8). Change one entry per
@@ -22,5 +22,5 @@
 //! 512: retreat and heal with any number of hunters tracked (wins over 4)
 //! Bits add up (5 = laser hunt and heal). Change one entry per submission.
 
-pub const SALTS: [u64; 8] = [3, 1002, 4, 4, 3, 4, 4, 3];
+pub const SALTS: [u64; 32] = [3,1002,3,4,4,4,4,3, 3,1002,4,4,3,4,4,3, 3,1002,4,4,3,4,4,3, 3,1002,4,4,3,4,4,3];
 pub const VARIANT: [u16; 8] = [16, 0, 0, 0, 0, 0, 0, 0];

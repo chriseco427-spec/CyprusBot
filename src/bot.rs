@@ -753,7 +753,7 @@ impl Bot {
         };
         let g = (key % salts::SALTS.len() as u64) as usize;
         self.salt_group = g as i32;
-        self.variant = variant_env().unwrap_or(salts::VARIANT[g]);
+        self.variant = variant_env().unwrap_or(salts::VARIANT[g % 8]);
         self.rng = rng_seed(self.seed0, salts::SALTS[g]);
         eprintln!("salt group {} slot {} next centre {} draws before {}", g, self.slot, nc, self.rng_draws);
     }
