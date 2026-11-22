@@ -227,9 +227,10 @@ fn arc_knob(i: usize) -> f32 {
 /// Weapon fire heard from two directions before our first kill marks a free-for-all.
 fn crossfire_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Off: in simulated practice it fired on the house squad too and cost about a point, and
-    // house bots shoot crates and drones from 3 s on. `MB_XFIRE=1` turns it on for testing.
-    *K.get_or_init(|| std::env::var("MB_XFIRE").is_ok())
+    // On, with the revert at `xf_revert_s` (18 s): a free-for-all set by gunfire alone goes back to
+    // practice if nobody but us has killed anything by then. Practice scoring now uses fresh seeds,
+    // so nothing is fitted to the old fixed matches. `MB_NOXFIRE=1` turns it off (simulator, bed).
+    *K.get_or_init(|| std::env::var("MB_NOXFIRE").is_err())
 }
 
 /// Discovery risk of standing still at ground spots on an 8 m lattice, row by row from the
@@ -433,7 +434,7 @@ fn last4_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOLAST4").is_err())
 }
 
-/// Seconds after which a free-for-all guessed from gunfire volume alone is undone if nobody but
+/// Seconds after which a free-for-all guessed from gunfire alone is undone if nobody but
 /// us has killed anything (`MB_XFREVERT`, 0 = never).
 fn xf_revert_s() -> f32 {
     static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -1555,7 +1556,7 @@ impl Bot {
             // apart, three shots each, before we have killed anyone, is mechs fighting each other:
             // in recorded free-for-alls that happens within 5 s for five mechs in six, while the
             // first death (the old signal) comes at a median of 14 s and often after 20 s.
-            let crossfire = crossfire_on() && self.mode != 2 && self.kills == 0 && t < 45.0 && {
+            let crossfire = crossfire_on() && !self.xf_off && self.mode != 2 && self.kills == 0 && t < 45.0 && {
                 let h = &self.fire_heard;
                 let centres: Vec<f32> = h.iter().filter(|a| h.iter().filter(|b| wrap(a.0 - b.0).abs() < 0.35).count() >= 3).map(|a| a.0).collect();
                 centres.iter().any(|a| centres.iter().any(|b| wrap(a - b).abs() >= 1.05))
@@ -1574,28 +1575,30 @@ impl Bot {
                 }
                 bins.iter().filter(|&&c| c >= 3).count() >= xn
             };
-            // The volume rule alone is a guess (the house squad set it off in some practice
-            // matches: 5.31 against 5.75). Remember when it was the only reason, and undo it if
-            // nobody but us has killed anything by the revert time: 97% of real free-for-alls have
-            // a death we did not cause by 20 s.
-            let sure = foreign_death || foreign_damage || crossfire || (self.mode == 0 && (wounded_by_others || ganged));
-            if self.mode != 2 && crossfire2 && !sure {
+            // Gunfire alone (the two-direction rule or the volume rule) is a guess: the house squad
+            // shoots crates and drones from several directions too. Remember when it was the only
+            // reason, and undo it if nobody but us has killed anything by the revert time: 97% of
+            // real free-for-alls have a death we did not cause by 20 s.
+            let foreign = foreign_death || foreign_damage || wounded_by_others || ganged;
+            let sure = foreign_death || foreign_damage || (self.mode == 0 && (wounded_by_others || ganged));
+            if self.mode != 2 && (crossfire || crossfire2) && !foreign {
                 self.xf_t = t;
             }
-            if sure {
+            if foreign {
                 self.xf_t = -1.0;
+            }
+            if (sure || crossfire || crossfire2) && self.mode != 2 && std::env::var("MB_MODELOG").is_ok() {
+                eprintln!("MODE2 t={:.1} kills={} foreign_death={}", t, self.kills, foreign_death);
+            }
+            if sure || crossfire || crossfire2 {
+                self.mode = 2;
             }
             if self.mode == 2 && self.xf_t >= 0.0 && xf_revert_s() > 0.0 && t >= xf_revert_s() && self.alive0 - alive <= self.kills {
                 self.mode = 1;
                 self.xf_t = -1.0;
                 self.xf_off = true;
             }
-            if (sure || crossfire2) && self.mode != 2 && std::env::var("MB_MODELOG").is_ok() {
-                eprintln!("MODE2 t={:.1} kills={} foreign_death={}", t, self.kills, foreign_death);
-            }
-            if sure || crossfire2 {
-                self.mode = 2;
-            } else if self.mode == 0 && t >= self.tune[9] {
+            if self.mode == 0 && !(sure || crossfire || crossfire2) && t >= self.tune[9] {
                 self.mode = 1;
             }
         }
