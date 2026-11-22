@@ -414,6 +414,11 @@ fn foreign_damage_on() -> bool {
     *K.get_or_init(|| std::env::var("MB_NOFD").is_err())
 }
 
+fn flip_slack() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_NOFLIP").is_err())
+}
+
 fn scav_on() -> bool {
     static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_NOSCAV").is_err())
@@ -1320,7 +1325,12 @@ impl Bot {
             }
             // A death we did not cause means a free-for-all. Wait a second before believing it, in
             // case the kill event for our own shot arrives an observation late.
-            if self.alive0 - alive > self.kills {
+            // A mech we have shot at can be finished by a drone or the zone, with no kill credited
+            // to us: in simulated practice that happens in one match in eleven, and reading it as
+            // a free-for-all made us hide for the rest of a practice match. Once we have hit
+            // anyone, it takes a second unexplained death.
+            let slack = if flip_slack() && !self.i_hit.is_empty() { 1 } else { 0 };
+            if self.alive0 - alive > self.kills + slack {
                 if self.foreign_since < 0.0 {
                     self.foreign_since = t;
                 }
