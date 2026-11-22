@@ -563,6 +563,71 @@ const V_EAGER: u16 = 16384;
 /// before the opening-safety commit. Never acts in confirmed free-for-all.
 const V_OPEN_OFF: u16 = 32768;
 
+/// Late-game practice switches, all off (practice mode only). `MB_PG=134` turns on 1, 3 and 4 in
+/// the simulator.
+/// 1 `PG_DROP_REPAIR`: HP below 80% and a supply drop landed or landing within 200 m inside the
+///   zone: go and hold its ring for the capture before anything else, shooting as usual.
+/// 2 `PG_REST_AFTER5`: from the fifth kill, nothing in view for 3 s and HP below 85%: cover, all
+///   fire held, until HP is above 95% or a mech shows up.
+/// 3 `PG_CUBE_STOP`: with ten cubes, no more walks to cubes, no crates, no drone farming.
+/// 4 `PG_HOLD_FOR_HUNTER`: holding a laser, a hunter coming at us from beyond 150 m: wait near
+///   cover and let it come, charging as it enters range.
+const PG_DROP_REPAIR: bool = false;
+const PG_REST_AFTER5: bool = false;
+const PG_CUBE_STOP: bool = false;
+const PG_HOLD_FOR_HUNTER: bool = false;
+/// Kills needed before PG_REST_AFTER5 acts (5; `MB_PGK` overrides it in the simulator).
+fn pg_kills() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_PGK").ok().and_then(|v| v.parse().ok()).unwrap_or(5.0))
+}
+fn pg(i: usize) -> bool {
+    static K: std::sync::OnceLock<[bool; 4]> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let e = std::env::var("MB_PG").unwrap_or_default();
+        [PG_DROP_REPAIR || e.contains('1'), PG_REST_AFTER5 || e.contains('2'), PG_CUBE_STOP || e.contains('3'), PG_HOLD_FOR_HUNTER || e.contains('4')]
+    })[i]
+}
+
+/// Practice design (private/FULL_SET_GAPS.md). 0 = the behaviour of the build before design B;
+/// 1 = design B, one coherent practice design, practice (mode 1) only plus the opening weapon run:
+/// 1 weapon run from second 0 (strong laser preference, short reach in a fight, 12 s give-up);
+/// 2 fight range by weapon (gun 80 m, laser 130 m) with a finishing exemption;
+/// 3 restraint: no first shot at a bot that has not attacked or approached us while we hold only
+///   the gun (until 2 minutes), hunters first, the one hurting us, stay on it, the nearly dead;
+/// 4 retreat and heal: below 40% HP, or below two thirds with two or more hunters on us, hold fire,
+///   back at 80%; never while a fight is nearly won;
+/// 5 errands between kills in a fixed order. (The early laser release is its own switch.)
+/// `MB_DESIGN=1` switches it on in the simulator; `MB_DBOFF=34` switches items off (ablation);
+/// `DESIGN_B_RETREAT` below (false) leaves item 4 out.
+pub const PRACTICE_DESIGN: u8 = 0;
+fn dboff(n: u8) -> bool {
+    static K: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    (n == 4 && !DESIGN_B_RETREAT) || K.get_or_init(|| std::env::var("MB_DBOFF").unwrap_or_default()).contains((b'0' + n) as char)
+}
+/// Design B item 4 (retreat and heal), off inside design B: in the simulator it costs 0.3 to 0.6
+/// points; true switches it on.
+const DESIGN_B_RETREAT: bool = false;
+/// Design B thresholds (`DB_TUNE=a,b,...` in the simulator): 0 leave below this HP fraction,
+/// 1 leave below this with two hunters on us (0 = never), 2 return at this fraction, 3 restraint
+/// ends at this time (s), 4 harmless-bot reach with a laser (m), 5 gun range, 6 laser range.
+fn dbk(i: usize) -> f32 {
+    static K: std::sync::OnceLock<[f32; 7]> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let mut k = [0.40, 0.67, 0.8, 120.0, 160.0, 80.0, 130.0];
+        if let Ok(e) = std::env::var("DB_TUNE") {
+            for (j, x) in e.split(',').enumerate().take(7) {
+                k[j] = x.parse().unwrap_or(k[j]);
+            }
+        }
+        k
+    })[i]
+}
+fn design_b() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| PRACTICE_DESIGN == 1 || std::env::var("MB_DESIGN").map_or(false, |v| v == "1"))
+}
+
 fn variant_env() -> Option<u16> {
     static K: std::sync::OnceLock<Option<u16>> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_VARIANT").ok().and_then(|v| v.parse().ok()))
@@ -609,12 +674,23 @@ pub struct Bot {
     variant: u16,
     variant_seen: std::cell::Cell<u16>,
     regroup: bool,
+    /// PG_HOLD_FOR_HUNTER: the waiting spot, when it was chosen, and for which hunter.
+    hfh_cover: Option<(f32, f32)>,
+    hfh_t: f32,
+    hfh_id: i64,
     watched_t: f32,
     run0_id: i64,
     run0_t0: f32,
     side_id: i64,
     side_t: f32,
     strafe_floor: f32,
+    /// Design B: when an enemy began closing on us, the target we stay on, whether no cover was
+    /// found for the retreat, and the current errand.
+    close_since: HashMap<i64, f32>,
+    db_target: i64,
+    db_nocover: bool,
+    errand_id: i64,
+    errand_t0: f32,
     rng_draws: u32,
     pickup_radius: f32,
     enemies: HashMap<i64, Enemy>,
@@ -785,12 +861,20 @@ impl Bot {
             variant: 0,
             variant_seen: std::cell::Cell::new(0),
             regroup: false,
+            hfh_cover: None,
+            hfh_t: -100.0,
+            hfh_id: -1,
             watched_t: -100.0,
             run0_id: -1,
             run0_t0: -100.0,
             side_id: -1,
             side_t: -100.0,
             strafe_floor: 0.0,
+            close_since: HashMap::new(),
+            db_target: -1,
+            db_nocover: false,
+            errand_id: -1,
+            errand_t0: -100.0,
             rng_draws: 0,
             pickup_radius: pr,
             enemies: HashMap::new(),
@@ -913,6 +997,26 @@ impl Bot {
     /// Opening safety (see `opening_safe_on`) unless the group switched it off with V_OPEN_OFF.
     pub(crate) fn open_safe(&self) -> bool {
         opening_safe_on() && !self.vgate(V_OPEN_OFF, self.mode != 2)
+    }
+
+    /// Design B in confirmed practice.
+    fn db(&self) -> bool {
+        design_b() && self.mode == 1
+    }
+
+    /// Design B item `n` (see `PRACTICE_DESIGN`) in confirmed practice.
+    fn dbi(&self, n: u8) -> bool {
+        self.db() && !dboff(n)
+    }
+
+    /// Design B, also before the match type is known (the opening weapon run).
+    fn db_open(&self) -> bool {
+        design_b() && self.mode != 2
+    }
+
+    /// Sidestep timing: the V_SIDESTEP switch.
+    fn side_on(&self) -> bool {
+        self.vsw(V_SIDESTEP)
     }
 
     /// Same, with the caller deciding which modes the switch may act in (`ok`).
@@ -1579,6 +1683,27 @@ impl Bot {
                 }
             }
         }
+        // Design B: a house bot that closes on us from inside 250 m counts as a hunter, like one
+        // that aims at us or hits us.
+        if self.dbi(3) {
+            let mut cs = std::mem::take(&mut self.close_since);
+            for e in self.enemies.values_mut() {
+                let mut closing = false;
+                if e.seen >= t - 0.01 && dxy(&e.pos, &me.pos) < 250.0 {
+                    let to = norm2([me.pos[0] - e.pos[0], me.pos[1] - e.pos[1]]);
+                    closing = e.vel[0] * to[0] + e.vel[1] * to[1] > 3.5;
+                }
+                if closing {
+                    let since = *cs.entry(e.id).or_insert(t);
+                    if t - since >= 0.6 {
+                        e.hostile_until = e.hostile_until.max(t + 6.0);
+                    }
+                } else {
+                    cs.remove(&e.id);
+                }
+            }
+            self.close_since = cs;
+        }
         // ---- which kind of match is this? Mechs dying that we did not kill means a free-for-all.
         let alive = obs["alive"].as_i64().unwrap_or(16);
         if self.cfg_mode == 0 {
@@ -1792,6 +1917,11 @@ impl Bot {
                 let busy_other = threats.iter().any(|o| o.id != e.id && dxy(&o.pos, &e.pos) < 220.0 && wrap(aim_to(e.eye(), o.center())[0] - e.aim[0]).abs() < 0.25);
                 let snow_veto = self.mode == 2 && snow_veto_on() && e.cubes >= 10.0 && t - e.hurt_me_t > 30.0 && e.hp >= 0.4 * e.max_hp && !busy_other;
                 (e.hostile_until > t && !snow_veto) || prey || ambush || committed || (alive <= 4 && my_power > 1.4 * power(e) && !shunned)
+            } else if self.dbi(3) {
+                // Design B: a bot that has not attacked or approached us is harmless: no first shot
+                // while we hold only the gun, until two minutes in. With a laser we fight harmless
+                // bots too, but only from closer than hunters.
+                e.hostile_until > t || t >= dbk(3) || (laser_s.is_some() && d < dbk(4))
             } else {
                 match if pol2 { 2 } else { self.policy } {
                     1 => e.hostile_until > t,
@@ -1801,6 +1931,18 @@ impl Bot {
             };
             if allowed && d < 260.0 && (self.w.los(muzzle, e.center()) || (self.mode != 2 && fr(1) && self.w.los(muzzle, e.upper()))) {
                 let mut score = d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 };
+                if self.dbi(3) {
+                    // The one hurting us first, the one we are on, the nearly dead.
+                    if t - e.hurt_me_t < 4.0 {
+                        score -= 200.0;
+                    }
+                    if e.id == self.db_target {
+                        score -= 40.0;
+                    }
+                    if e.hp < 0.3 * e.max_hp {
+                        score -= 60.0;
+                    }
+                }
                 // Free-for-all: our laser does 60% more to a mortar carrier.
                 if (self.mode == 2 || pf(6)) && mortar_first_on() && laser_s.is_some() && e.has("mortar") {
                     score -= 40.0;
@@ -1812,6 +1954,14 @@ impl Bot {
             }
         }
         let finishable = target.as_ref().map_or(false, |e| e.hp <= 180.0);
+        if self.db() {
+            if let Some(e) = &target {
+                self.db_target = e.id;
+            }
+        }
+        // Design B: a target inside 120 m that is nearly dead, or has under half our HP, is a fight
+        // we are about to win: no retreat, no stepping back.
+        let db_fin = self.db() && target.as_ref().map_or(false, |e| dxy(&e.pos, &me.pos) < 120.0 && (e.hp < 0.3 * e.max_hp || e.hp < 0.5 * me.hp));
         if let Some(e) = &target {
             // A target only exists with a line of fire, so this times how long we have had it.
             if e.id != self.los_id || t - self.los_last > 0.25 {
@@ -1954,6 +2104,21 @@ impl Bot {
                 self.cover = None;
             }
             self.retreating = evade;
+        } else if self.tune[3] < 0.5 && self.dbi(4) {
+            // Design B, retreat and heal: leave when clearly hurt (below 40% HP with a mech tracked),
+            // or below two thirds with two or more hunters on us; hold fire (regeneration starts
+            // 5 s after the last damage dealt or taken); return at 80%. A fight that is nearly won
+            // is never left.
+            let tracked = self.enemies.values().filter(|e| t - e.seen < 8.0).count();
+            let hunters = threats.iter().filter(|e| e.hostile_until > t && dxy(&e.pos, &me.pos) < 180.0).count();
+            let leave = (hp_frac < dbk(0) && tracked >= 1) || (hunters >= 2 && hp_frac < dbk(1));
+            if !self.retreating && leave && !finishable && !db_fin {
+                self.retreating = true;
+                self.cover = None;
+                self.db_nocover = false;
+            } else if self.retreating && (hp_frac >= dbk(2) || finishable || db_fin) {
+                self.retreating = false;
+            }
         } else if self.tune[3] < 0.5 {
             // Practice break-and-heal (switch V_HEAL, or PR_TUNE knob 23): badly hurt
             // with enough hunters about (knob 26 tracked, 0 = any), break line of sight and
@@ -1971,14 +2136,18 @@ impl Bot {
             }
             // Regroup in the lulls (V_REGROUP): never leaves a fight (it starts only with nothing in
             // view) and ends the moment a mech shows up or hits us.
-            if self.vsw(V_REGROUP) {
+            // PG_REST_AFTER5 uses the same rule from the fifth kill, starting below 85% and
+            // resting to above 95%.
+            let rest5 = pg(1) && self.mode == 1 && self.kills as f32 >= pg_kills();
+            if self.vsw(V_REGROUP) || rest5 {
+                let (lo, hi) = if self.vsw(V_REGROUP) { (0.6, 0.9) } else { (0.85, 0.95) };
                 if self.enemies.values().any(|e| t - e.seen < 5.0 && self.w.los(e.eye(), my_center)) {
                     self.watched_t = t;
                 }
-                if !self.regroup && hp_frac < 0.6 && threats.is_empty() && t - self.last_hurt_t > 2.0 && t - self.watched_t > 3.0 && !finishable {
+                if !self.regroup && hp_frac < lo && threats.is_empty() && t - self.last_hurt_t > 2.0 && t - self.watched_t > 3.0 && !finishable {
                     self.regroup = true;
                     self.cover = None;
-                } else if self.regroup && (hp_frac >= 0.9 || !threats.is_empty() || t - self.last_hurt_t < 1.0) {
+                } else if self.regroup && (hp_frac >= hi || !threats.is_empty() || t - self.last_hurt_t < 1.0) {
                     self.regroup = false;
                 }
                 if self.regroup {
@@ -2058,8 +2227,10 @@ impl Bot {
         }
 
         // Nearest cube we can walk to: worth grabbing even mid-fight (HP, damage, upgrades).
+        // PG_CUBE_STOP: with ten cubes nothing is worth a detour (a cube on our path is still taken).
+        let cube_stop = pg(2) && self.mode == 1 && me.cubes >= 10.0;
         let mut near_cube: Option<(f32, (f32, f32), i64)> = None;
-        for (id, it) in &self.cubes {
+        for (id, it) in self.cubes.iter().filter(|_| !cube_stop) {
             if self.blacklist.get(id).map_or(false, |u| t < *u) {
                 continue;
             }
@@ -2077,7 +2248,7 @@ impl Bot {
                     continue;
                 }
                 let d = dxy(&it.pos, &me.pos);
-                if d < 60.0 && in_bounds(&it.pos) && (it.pos[2] - me.pos[2]).abs() < 5.0 && near_gun.map_or(true, |c| d < c.0) {
+                if d < (if self.dbi(2) { 70.0 } else { 60.0 }) && in_bounds(&it.pos) && (it.pos[2] - me.pos[2]).abs() < 5.0 && near_gun.map_or(true, |c| d < c.0) {
                     near_gun = Some((d, (it.pos[0], it.pos[1]), *id));
                 }
             }
@@ -2141,11 +2312,34 @@ impl Bot {
         let hunt_bounds = |p: &[f32]| -> bool { in_bounds(p) || (lhunt && dxy(p, &z.c) < z.r - 8.0 && dxy(p, &me.pos) < 80.0) };
         let practice_rush = if self.mode == 1 && !p_lite { self.practice_weapon_goal(&me, t, laser_s.is_some(), light_s.is_some(), &hunt_bounds, lhunt) } else { None };
 
+        // Design B, between kills: a fixed order of errands (laser if none, a weapon for the empty
+        // slot, cubes, the site of a recent death), each given up after 10 s and ignored for 60 s.
+        let mut errand: Option<(f32, (f32, f32), i64)> = None;
+        if self.dbi(5) && !self.retreating && threats.is_empty() {
+            errand = self.practice_errand(&me, t, laser_s.is_some(), &in_bounds);
+            if let Some(r) = errand {
+                if r.2 != self.errand_id {
+                    self.errand_id = r.2;
+                    self.errand_t0 = t;
+                } else if t - self.errand_t0 > 10.0 {
+                    if r.2 >= 0 {
+                        self.blacklist.insert(r.2, t + 60.0);
+                    } else {
+                        self.scav.retain(|x| (x.0[0] - r.1 .0).hypot(x.0[1] - r.1 .1) > 30.0);
+                    }
+                    self.errand_id = -9;
+                    errand = None;
+                }
+            } else {
+                self.errand_id = -1;
+            }
+        }
+
         // Weapon run from second 0 (V_RUN0): gun only, head straight for the nearest laser we know
         // of (lightning when no laser is), boosting while the tank is above 40. Gives up on one pickup
         // after 12 s and ignores it for 30 s, and while a mech is hitting us.
         let mut run0: Option<(f32, (f32, f32), i64)> = None;
-        if self.vgate(V_RUN0, self.mode != 2) && me.wpn[1].is_none() && !self.retreating && t - self.last_hurt_t > 3.0 {
+        if (self.vgate(V_RUN0, self.mode != 2) || (self.db_open() && !dboff(1))) && me.wpn[1].is_none() && !self.retreating && t - self.last_hurt_t > 3.0 {
             for (id, it) in &self.pickups {
                 let reach = match it.kind.as_str() {
                     "laser" => practice::knob(1),
@@ -2153,6 +2347,8 @@ impl Bot {
                     _ => continue,
                 };
                 let d = dxy(&it.pos, &me.pos);
+                // Design B: a short reach while a mech is in view (a fight is on).
+                let reach = if self.db_open() && !dboff(1) && !threats.is_empty() { reach.min(70.0) } else { reach };
                 if self.blacklist.get(id).map_or(false, |u| t < *u) || d > reach || it.pos[2] - me.pos[2] > 3.0 || !in_bounds(&it.pos) || (it.pos[2] - self.w.surf_at(it.pos[0], it.pos[1])).abs() > 2.0 {
                     continue;
                 }
@@ -2194,7 +2390,7 @@ impl Bot {
         let drone_flee = drone_hot && (drones_near >= 2 || ((self.mode == 2 || pf(3)) && hp_frac <= 0.2));
         let eager = self.vsw(V_EAGER) && hp_frac > 0.4;
         let cover_open_on = self.vsw(V_COVERSPOT) && self.kills == 0;
-        let farm_drone = self.tune[15] < 0.5 && drones_near <= 1 && target.is_none() && ((hp_frac > 0.75 && t >= 25.0) || eager) && quiet;
+        let farm_drone = self.tune[15] < 0.5 && drones_near <= 1 && !cube_stop && errand.is_none() && target.is_none() && ((hp_frac > 0.75 && t >= 25.0) || eager) && quiet;
         if !drone_flee && ((drone_hot && drones_near == 1 && hp_frac > 0.2) || farm_drone) {
             let mut bd = 85.0;
             for n in &npcs {
@@ -2296,7 +2492,10 @@ impl Bot {
                         }
                     }
                     None => {
-                        if !cautious {
+                        if self.db() {
+                            // Design B: no cover in reach, fight on with fire free.
+                            self.db_nocover = true;
+                        } else if !cautious {
                             // No cover in reach: run from the nearest threat, staying in the zone.
                             let e = evade_from.iter().min_by(|a, b| dxy(&a.pos, &me.pos).partial_cmp(&dxy(&b.pos, &me.pos)).unwrap()).unwrap();
                             let away = norm2([here.0 - e.pos[0], here.1 - e.pos[1]]);
@@ -2320,6 +2519,28 @@ impl Bot {
                             }
                         }
                     }
+                }
+            }
+        }
+        // PG_DROP_REPAIR: hurt, with a supply drop in reach: go and hold its ring for the capture.
+        let pg_drop = if pg(0) && self.mode == 1 && !zone_urgent { self.pg_drop_goal(&me, t, obs, &in_bounds) } else { None };
+        // PG_HOLD_FOR_HUNTER: with a laser and a hunter coming at us from beyond 150 m, wait near
+        // cover and let it come.
+        let mut pg_hold: Option<Mv> = None;
+        if pg(3) && self.mode == 1 && laser_s.is_some() && !self.retreating {
+            if let Some(e) = &target {
+                let d = dxy(&e.pos, &me.pos);
+                let to = norm2([me.pos[0] - e.pos[0], me.pos[1] - e.pos[1]]);
+                if e.hostile_until > t && d > 150.0 && e.vel[0] * to[0] + e.vel[1] * to[1] > 1.0 {
+                    if self.hfh_id != e.id || t - self.hfh_t > 1.0 {
+                        self.hfh_cover = self.find_cover(&me, std::slice::from_ref(e), &z, false, 24.0, 3.0);
+                        self.hfh_id = e.id;
+                        self.hfh_t = t;
+                    }
+                    pg_hold = Some(match self.hfh_cover {
+                        Some(c) if (c.0 - here.0).hypot(c.1 - here.1) > 1.5 => Mv::Goto(c, false),
+                        _ => Mv::Hold,
+                    });
                 }
             }
         }
@@ -2350,6 +2571,22 @@ impl Bot {
             }
         } else if let Some(cm) = cover_mv {
             mv = cm;
+        } else if let Some(g) = pg_drop {
+            // Run for the drop, then keep moving inside its 8 m ring for the 4 s capture; shooting
+            // goes on as usual.
+            let (dx, dy) = (g.0 - here.0, g.1 - here.1);
+            let dd = dx.hypot(dy);
+            if dd > 4.5 {
+                mv = Mv::Goto(g, me.energy > 30.0 && dd > 15.0);
+            } else {
+                let r = norm2([here.0 - g.0, here.1 - g.1]);
+                let side = if (t * 1.2).sin() > 0.0 { 1.0 } else { -1.0 };
+                let tang = [-r[1] * side, r[0] * side];
+                let pull = (dd / 4.5).min(1.0);
+                mv = Mv::Direct(norm2([tang[0] - r[0] * pull, tang[1] - r[1] * pull]), false);
+            }
+        } else if let Some(h) = pg_hold {
+            mv = h;
         } else if let Some(pm) = peek_mv {
             mv = pm;
         } else if let (Some(r), false) = (run0, cornered) {
@@ -2423,6 +2660,16 @@ impl Bot {
                     range = pr;
                 }
             }
+            if self.dbi(2) {
+                // Design B: the gun holds 80 m, a laser 130 m (90 m against a harmless bot); a
+                // nearly dead target (under a third) is closed on at point-blank while we are
+                // above 40% and at most two are near.
+                range = if laser_s.is_some() { if e.hostile_until > t { dbk(6) } else { 90.0 } } else { dbk(5) };
+                let near2 = threats.iter().filter(|o| dxy(&o.pos, &me.pos) < 150.0).count() <= 2;
+                if e.hp < 0.33 * e.max_hp && hp_frac > 0.4 && near2 {
+                    range = 25.0;
+                }
+            }
             if light_s.is_some() && me.energy > 25.0 {
                 range = 30.0;
             } else if e.has("lightning") {
@@ -2431,7 +2678,7 @@ impl Bot {
             // Sidestep timing (V_SIDESTEP): no reversal sooner than the bullet's flight time over
             // this distance (252 m/s), and one reversal, held for a second, when a laser that is
             // aimed at us starts to charge.
-            let side = self.vsw(V_SIDESTEP);
+            let side = self.side_on();
             if side {
                 let lc = threats.iter().find(|o| o.has("laser") && o.charging && wrap(aim_to(o.eye(), my_center)[0] - o.aim[0]).abs() < 0.12).map(|o| o.id);
                 if let Some(id) = lc {
@@ -2517,7 +2764,7 @@ impl Bot {
                     }
                 }
             }
-            for (id, it) in &self.cubes {
+            for (id, it) in self.cubes.iter().filter(|_| !cube_stop) {
                 if in_bounds(&it.pos) && (it.pos[2] - me.pos[2]).abs() < 6.0 && !danger(&it.pos) {
                     consider(dxy(&it.pos, &me.pos) * 0.5, &it.pos, *id, &mut goal);
                 }
@@ -2539,7 +2786,7 @@ impl Bot {
                     consider(dxy(&it.pos, &me.pos) * pref, &it.pos, *id, &mut goal);
                 }
             }
-            if (hp_frac > 0.85 || eager) && calm && (!cautious || t >= self.tune[18]) {
+            if (hp_frac > 0.85 || eager) && calm && !cube_stop && (!cautious || t >= self.tune[18]) {
                 for (id, it) in &self.crates {
                     if in_bounds(&it.pos) && !danger(&it.pos) && (!cautious || it.pos[2] - me.pos[2] <= 3.0) {
                         consider(dxy(&it.pos, &me.pos) * 1.0 + 10.0, &it.pos, *id, &mut goal);
@@ -2580,6 +2827,9 @@ impl Bot {
                 if let Some(g) = self.scav_goal {
                     goal = Some((dxy(&[g.0[0], g.0[1], 0.0], &me.pos), (g.0[0], g.0[1]), -2));
                 }
+            }
+            if let Some(r) = errand {
+                goal = Some(r);
             }
             if let Some(c) = shoot_crate {
                 // Close enough to shoot; keep walking in until 20 m so the cube is near.
@@ -3036,7 +3286,7 @@ impl Bot {
         }
         // Practice break-and-heal (knob 23): dealing damage also resets the regeneration clock, so
         // hold fire while healing. Only this rule sets `retreating` in practice.
-        if self.retreating && (self.heal_on() || (self.regroup && self.vsw(V_REGROUP))) {
+        if self.retreating && (self.heal_on() || (self.regroup && (self.vsw(V_REGROUP) || pg(1))) || (self.dbi(4) && !self.db_nocover)) {
             fire = [false, false];
         }
         // Reload in quiet moments.
@@ -3073,7 +3323,7 @@ impl Bot {
         a.insert("tick".into(), obs["tick"].clone());
         a.insert("move".into(), json!([r3(mvec[0]), r3(mvec[1])]));
         a.insert("boost".into(), json!(boost));
-        if jump && target.is_some() && t - self.last_hurt_t < 2.0 && self.vsw(V_SIDESTEP) {
+        if jump && target.is_some() && t - self.last_hurt_t < 2.0 && self.side_on() {
             jump = false; // a mech in the air cannot change direction
         }
         a.insert("jump".into(), json!(jump));
