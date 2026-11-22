@@ -242,7 +242,7 @@ pub(crate) fn pf(i: usize) -> bool {
 /// - gun gate: fire when the aim is within 3.0 m of the lead point (was 2.2 m; the body is 2.5 m
 ///   wide and the gun was ready but silent in 5% of fight time for want of the last metre).
 ///   Off: 2% more shots, no more damage, and 0.13 points lower in simulated practice.
-const FR_GUN_GATE: bool = false;
+const FR_GUN_GATE: bool = true;
 /// - upper body: when a mech's centre is behind cover but its upper body is in our line of fire
 ///   (a shooter back from a roof edge, a low wall), shoot at the upper body instead of not at all.
 const FR_TOP_AIM: bool = true;
@@ -574,7 +574,7 @@ const V_OPEN_OFF: u16 = 32768;
 ///   cover and let it come, charging as it enters range.
 const PG_DROP_REPAIR: bool = false;
 const PG_REST_AFTER5: bool = false;
-const PG_CUBE_STOP: bool = false;
+const PG_CUBE_STOP: bool = true;
 const PG_HOLD_FOR_HUNTER: bool = false;
 /// Kills needed before PG_REST_AFTER5 acts (5; `MB_PGK` overrides it in the simulator).
 fn pg_kills() -> f32 {
