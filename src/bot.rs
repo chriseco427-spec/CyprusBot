@@ -60,6 +60,8 @@ struct Wpn {
     mag: f32,
     full_charge: f32,
     energy: f32,
+    /// Damage at full charge after upgrades (laser), from the weapon's stats.
+    damage: f32,
 }
 
 struct Me {
@@ -173,6 +175,15 @@ impl Cfg {
 /// 13: break-away time (s)   14: after a dodge, stay hidden until that charge is spent
 /// 15: no weapon rush outside confirmed practice (1). Every showdown build with the free-for-all
 ///     rush (b788b9c on) did badly (5.0 to 5.8 points); the one without it scored 12.2.
+/// Early laser release (all modes): let go as soon as the charge so far already does the target's
+/// visible HP plus `LASER_EARLY_MARGIN`. Set to false to switch it off (or `MB_NOLASEREARLY=1`).
+const LASER_EARLY: bool = true;
+const LASER_EARLY_MARGIN: f32 = 1.10;
+fn laser_early_on() -> bool {
+    static K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *K.get_or_init(|| LASER_EARLY && std::env::var("MB_NOLASEREARLY").is_err())
+}
+
 fn fx(i: usize) -> f32 {
     static K: std::sync::OnceLock<[f32; 16]> = std::sync::OnceLock::new();
     K.get_or_init(|| {
@@ -889,6 +900,7 @@ impl Bot {
                     mag: ws["mag"].as_f64().unwrap_or(12.0) as f32,
                     full_charge: ws["charge"].as_f64().unwrap_or(0.75) as f32,
                     energy: ws["energy"].as_f64().unwrap_or(3.0) as f32,
+                    damage: ws["damage"].as_f64().unwrap_or(315.0) as f32,
                 });
             }
         }
@@ -2799,14 +2811,21 @@ impl Bot {
                 let w = me.wpn[s].as_ref().unwrap();
                 if d < w.range - 5.0 && w.cooldown <= 0.1 {
                     let ready = w.charge >= w.full_charge - 0.06;
-                    if w.charge >= w.full_charge - 0.3 {
+                    // Early release: the charge so far (35% of full at none, linear to 100%, times
+                    // our cube bonus, 1.6 against a mortar carrier) already covers its visible HP.
+                    let early = laser_early_on() && w.charge >= 0.16 && t - e.seen < 0.05 && {
+                        let frac = 0.35 + 0.65 * (w.charge / w.full_charge.max(0.01)).min(1.0);
+                        let dmg = w.damage * frac * (1.0 + 0.04 * me.cubes.min(10.0)) * if e.has("mortar") { 1.6 } else { 1.0 };
+                        dmg >= LASER_EARLY_MARGIN * e.hp && self.w.los(muzzle, c0)
+                    };
+                    if w.charge >= w.full_charge - 0.3 || early {
                         aim_pt = direct;
                     }
                     // Release at full charge, on target, and only once the target has been in our
                     // line of fire for a moment: in recorded matches, shots within 0.3 s of the
                     // target appearing hit 38%, full charges after that 84 to 96%.
                     let settled = fx(0) < 0.5 || t - self.los_since >= fx(2) || (timed_hold && full_held >= 0.4);
-                    if ready && on(direct) && settled {
+                    if (ready && settled || early) && on(direct) {
                         laser_release = true;
                     }
                     fire[s] = !laser_release;
