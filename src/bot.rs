@@ -153,7 +153,7 @@ impl Cfg {
     /// Who we may open fire on in practice once the guarded opening is over. 0: any house bot in
     /// sight. 1: only one that is hostile to us. 2: hostile ones, or anyone while none is hostile
     /// and we are above 90% HP.
-    pub const POLICY: u8 = 0;
+    pub const POLICY: u8 = 2;
     pub fn from_env() -> Cfg {
         let mut tune = Self::TUNE;
         if let Ok(e) = std::env::var("MB_TUNE") {
