@@ -19,7 +19,8 @@ impl Bot {
         let here = (me.pos[0], me.pos[1]);
         // (a') Already ducked a charge: stay out of its sight until it fires or lets go, or it
         // just catches us stepping back out. A held charge fires on its own 2 s after full.
-        if ffa_only && fx(14) > 0.5 && t < self.dodge_until {
+        let dodge_ok = ffa_only || super::pf(8);
+        if dodge_ok && fx(14) > 0.5 && t < self.dodge_until {
             match self.enemies.get(&self.dodge_id).cloned() {
                 Some(e) if !(e.seen >= t - 0.01 && !e.charging) => {
                     if !self.w.los(e.eye(), my_center) {
@@ -33,7 +34,7 @@ impl Bot {
             }
         }
         // (a) A charge aimed at us: get behind something before it lets go.
-        if ffa_only && fx(8) > 0.5 {
+        if dodge_ok && fx(8) > 0.5 {
             let mut aimed: Vec<&Enemy> = threats
                 .iter()
                 .filter(|e| {
@@ -59,7 +60,7 @@ impl Bot {
         // (c) A lightning holder close in while we hold a laser and no lightning: leave its 45 m.
         // Free-for-all: any time we lack lightning (4 walk-up deaths in 10 matches to lightning
         // carriers at 28 to 36 m came while we held only the gun).
-        let light_back = std::env::var("MB_NOLIGHTBACK").is_err() && self.mode == 2;
+        let light_back = std::env::var("MB_NOLIGHTBACK").is_err() && (self.mode == 2 || super::pf(7));
         if fx(11) > 0.5 && (has_laser || light_back) && !has_light {
             let close = threats
                 .iter()

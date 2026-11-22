@@ -197,6 +197,42 @@ fn fx(i: usize) -> f32 {
     })[i]
 }
 
+/// Practice fixes: bug fixes and plain improvements that were first shipped for confirmed
+/// free-for-alls only, so that the practice score would not be re-rolled. Each constant switches
+/// one of them on outside mode 2 as well (modes 0 and 1); `false` restores the older practice
+/// code path. They never change mode 2.
+/// - timed hold: time a full laser charge ourselves (the server reports charge only up to full
+///   and fires on its own 2 s later), let go after a short hold instead of crawling until then.
+const PF_TIMED_HOLD: bool = true;
+/// - jet out of an enclosed pocket when the zone point cannot be walked to.
+const PF_JET_POCKET: bool = true;
+/// - zone margin: stay 30 m inside the next circle (was 20) and treat the last 20 m before the
+///   current edge as urgent (was 10).
+const PF_ZONE_MARGIN: bool = true;
+/// - a lone drone hitting us at 20% HP or less: walk out of its reach instead of holding still.
+const PF_DRONE_FLEE: bool = true;
+/// - cover inside a known drone's reach (50 m) is not cover.
+const PF_DRONE_COVER: bool = true;
+/// - cover test against a shooter on a roof: it sidesteps along its own roof, at its height.
+const PF_ROOF_SIDE: bool = true;
+/// - with a laser in hand, prefer a mortar carrier as the target (the laser does 60% more to it).
+const PF_MORTAR_FIRST: bool = true;
+/// - back out of a lightning holder's 45 m whenever we hold no lightning (practice did so only
+///   while holding a laser). Off: it lost 0.10 points in simulated practice.
+const PF_LIGHT_BACK: bool = false;
+/// - step behind cover within reach when a laser charge is aimed at us. Off: no gain in
+///   simulated practice.
+const PF_DODGE: bool = false;
+const PF: [bool; 9] = [PF_TIMED_HOLD, PF_JET_POCKET, PF_ZONE_MARGIN, PF_DRONE_FLEE, PF_DRONE_COVER, PF_ROOF_SIDE, PF_MORTAR_FIRST, PF_LIGHT_BACK, PF_DODGE];
+/// Is practice fix `i` on? `MB_PF=<bit mask>` overrides the constants in the simulator (0 = all off).
+pub(crate) fn pf(i: usize) -> bool {
+    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let m = *K.get_or_init(|| {
+        std::env::var("MB_PF").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| PF.iter().enumerate().fold(0u32, |a, (i, on)| a | ((*on as u32) << i)))
+    });
+    (m >> i) & 1 == 1
+}
+
 /// How long a match that looks like practice is still treated as possibly a free-for-all.
 pub(crate) fn p_lite_until() -> f32 {
     static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -986,7 +1022,7 @@ impl Bot {
                 }
                 // Free-for-all: cover inside a known drone's reach is no cover (5 AM: we hid 24 m
                 // from a drone and it killed us).
-                if self.mode == 2 && self.npc_mem.values().any(|n| (n.0[0] - x).hypot(n.0[1] - y) < 50.0) {
+                if (self.mode == 2 || pf(4)) && self.npc_mem.values().any(|n| (n.0[0] - x).hypot(n.0[1] - y) < 50.0) {
                     continue;
                 }
                 let mut cost = d;
@@ -1014,7 +1050,7 @@ impl Bot {
                             // Free-for-all: a roof shooter sidesteps along its own roof, so test
                             // from there at its height (COUNTERS.md #5: cover picked against a
                             // ground-level eye often fails against a roof sniper).
-                            let same_roof = self.mode == 2 && roof_side_on() && (w.surf[pc] - e.pos[2]).abs() < 2.0;
+                            let same_roof = (self.mode == 2 || pf(5)) && roof_side_on() && (w.surf[pc] - e.pos[2]).abs() < 2.0;
                             if w.prism[pc] && !same_roof {
                                 continue;
                             }
@@ -1736,7 +1772,7 @@ impl Bot {
             if allowed && d < 260.0 && self.w.los(muzzle, e.center()) {
                 let mut score = d + self.tune[5] * e.hp - if t - e.hurt_me_t < 3.0 || e.hostile_until > t { self.tune[4] } else { 0.0 };
                 // Free-for-all: our laser does 60% more to a mortar carrier.
-                if self.mode == 2 && mortar_first_on() && laser_s.is_some() && e.has("mortar") {
+                if (self.mode == 2 || pf(6)) && mortar_first_on() && laser_s.is_some() && e.has("mortar") {
                     score -= 40.0;
                 }
                 if score < best {
@@ -1937,7 +1973,7 @@ impl Bot {
         // ---- zone
         // In free-for-alls the only zone deaths recorded were full-health hiders caught at the
         // edge, so keep a wider margin there.
-        let margin = (z.nr * 0.5).min(if self.mode == 2 { 30.0 } else { 20.0 });
+        let margin = (z.nr * 0.5).min(if self.mode == 2 || pf(2) { 30.0 } else { 20.0 });
         let d_next = dxy(&[here.0, here.1], &z.nc);
         let inside_next = d_next <= z.nr - margin;
         let zone_point = if d_next > 1e-3 {
@@ -1947,7 +1983,7 @@ impl Bot {
             (z.nc[0], z.nc[1])
         };
         let travel = (d_next - (z.nr - margin)).max(0.0) / me.walk;
-        let near_edge = dxy(&[here.0, here.1], &z.c) > z.r - if self.mode == 2 { 20.0 } else { 10.0 };
+        let near_edge = dxy(&[here.0, here.1], &z.c) > z.r - if self.mode == 2 || pf(2) { 20.0 } else { 10.0 };
         // Last four: head into the next circle 30 s early rather than 12 (one of our last-four
         // deaths was a full-HP burn outside it).
         let lead = if self.mode == 2 && last4_on() && alive <= 4 { 30.0 } else { 12.0 };
@@ -2125,7 +2161,7 @@ impl Bot {
         let drone_hot = self.tune[15] < 1.5 && t - self.npc_hurt_t < 2.5 && !npcs.is_empty() && target.is_none() && !enemy_los;
         // Low on HP next to one drone (free-for-all): no branch below covered it, so we held still
         // and let a lone drone finish us at 5 AM. Walk out of its reach instead.
-        let drone_flee = drone_hot && (drones_near >= 2 || (self.mode == 2 && hp_frac <= 0.2));
+        let drone_flee = drone_hot && (drones_near >= 2 || ((self.mode == 2 || pf(3)) && hp_frac <= 0.2));
         let eager = self.vsw(V_EAGER) && hp_frac > 0.4;
         let cover_open_on = self.vsw(V_COVERSPOT) && self.kills == 0;
         let farm_drone = self.tune[15] < 0.5 && drones_near <= 1 && target.is_none() && ((hp_frac > 0.75 && t >= 25.0) || eager) && quiet;
@@ -2615,7 +2651,7 @@ impl Bot {
                 // Free-for-all: the zone point, or a point we must reach, cannot be walked to (an
                 // enclosed pocket: 7 AM, 3rd place with full HP burned to death in one). Jet over
                 // the wall toward it, using the climb below.
-                let walled_in = self.mode == 2
+                let walled_in = (self.mode == 2 || pf(1))
                     && me.grounded
                     && (zone_urgent || !inside_next)
                     && dgoal > 8.0
@@ -2783,7 +2819,7 @@ impl Bot {
                 0.0
             }
         };
-        let timed_hold = self.mode == 2 && std::env::var("MB_NOTIMEDHOLD").is_err();
+        let timed_hold = (self.mode == 2 || pf(0)) && std::env::var("MB_NOTIMEDHOLD").is_err();
         let mut fire = [false, false];
         let mut laser_release = false;
         let mut aim;
