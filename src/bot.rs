@@ -574,8 +574,8 @@ const V_OPEN_OFF: u16 = 32768;
 ///   cover and let it come, charging as it enters range.
 const PG_DROP_REPAIR: bool = false;
 const PG_REST_AFTER5: bool = false;
-const PG_CUBE_STOP: bool = false;
-const PG_HOLD_FOR_HUNTER: bool = false;
+const PG_CUBE_STOP: bool = true;
+const PG_HOLD_FOR_HUNTER: bool = true;
 /// Kills needed before PG_REST_AFTER5 acts (5; `MB_PGK` overrides it in the simulator).
 fn pg_kills() -> f32 {
     static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
