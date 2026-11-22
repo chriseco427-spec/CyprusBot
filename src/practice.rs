@@ -83,12 +83,13 @@ impl Bot {
     /// at about 52% HP and come back 23 times in 40 (private/HOUSE.md); in practice every kill is
     /// a point, and a hunter we let go regenerates.
     pub(super) fn practice_finish_goal(&self, me: &Me, t: f32) -> Option<(f32, f32)> {
-        if knob(12) <= 0.0 || me.hp / me.max_hp.max(1.0) <= knob(13) {
+        let follow = if self.vsw(super::V_FOLLOW55) { 0.55 } else { knob(12) };
+        if follow <= 0.0 || me.hp / me.max_hp.max(1.0) <= knob(13) {
             return None;
         }
         self.enemies
             .values()
-            .filter(|e| t - e.seen < 6.0 && e.hit_by_me && e.hp / e.max_hp.max(1.0) < knob(12) && dxy(&e.pos, &me.pos) < 200.0)
+            .filter(|e| t - e.seen < 6.0 && e.hit_by_me && e.hp / e.max_hp.max(1.0) < follow && dxy(&e.pos, &me.pos) < 200.0)
             .min_by(|a, b| a.hp.partial_cmp(&b.hp).unwrap_or(std::cmp::Ordering::Equal))
             .map(|e| (e.pos[0], e.pos[1]))
     }

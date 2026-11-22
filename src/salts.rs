@@ -14,7 +14,13 @@
 //!   4: retreat and heal (HP below 35% with 3 or more mechs tracked: break line of sight, hold
 //!      fire, regenerate to 90%)
 //!   8: fight range 100 m for gun and laser
+//!  16: guarded opening off (also the first seconds of a free-for-all still read as practice)
+//!  32: fight range 40 m for gun and laser
+//!  64: fight range 150 m for gun and laser (of 8, 32 and 64 the lowest bit set wins)
+//! 128: follow up a wounded hunter below 55% HP instead of 65%
+//! 256: shared upgrade order instead of offense-first
+//! 512: retreat and heal with any number of hunters tracked (wins over 4)
 //! Bits add up (5 = laser hunt and heal). Change one entry per submission.
 
 pub const SALTS: [u64; 8] = [3, 1002, 4, 4, 3, 4, 4, 3];
-pub const VARIANT: [u8; 8] = [0; 8];
+pub const VARIANT: [u16; 8] = [0; 8];

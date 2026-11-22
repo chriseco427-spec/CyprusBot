@@ -435,13 +435,21 @@ fn flip_slack() -> bool {
 /// Per-group practice switches (`salts::VARIANT`, one bit mask per salt group). All are practice
 /// (mode 1) only. `MB_VARIANT=n` overrides the mask for every group (simulator and self-test);
 /// the scorer sets no environment, so the masks in `salts.rs` are what runs there.
-const V_LHUNT: u8 = 1;
-const V_POLICY2: u8 = 2;
-const V_HEAL: u8 = 4;
-const V_RANGE100: u8 = 8;
+const V_LHUNT: u16 = 1;
+const V_POLICY2: u16 = 2;
+const V_HEAL: u16 = 4;
+const V_RANGE100: u16 = 8;
+/// Guarded opening off (practice mode 1 only; it also reaches the first seconds of a free-for-all
+/// that is still read as practice).
+const V_PLITE0: u16 = 16;
+const V_RANGE40: u16 = 32;
+const V_RANGE150: u16 = 64;
+const V_FOLLOW55: u16 = 128;
+const V_SHAREDUP: u16 = 256;
+const V_HEAL_ANY: u16 = 512;
 
-fn variant_env() -> Option<u8> {
-    static K: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+fn variant_env() -> Option<u16> {
+    static K: std::sync::OnceLock<Option<u16>> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_VARIANT").ok().and_then(|v| v.parse().ok()))
 }
 
@@ -483,8 +491,8 @@ pub struct Bot {
     slot: i64,
     salted: bool,
     salt_group: i32,
-    variant: u8,
-    variant_seen: u8,
+    variant: u16,
+    variant_seen: std::cell::Cell<u16>,
     rng_draws: u32,
     pickup_radius: f32,
     enemies: HashMap<i64, Enemy>,
@@ -641,7 +649,7 @@ impl Bot {
             salted: false,
             salt_group: -1,
             variant: 0,
-            variant_seen: 0,
+            variant_seen: std::cell::Cell::new(0),
             rng_draws: 0,
             pickup_radius: pr,
             enemies: HashMap::new(),
@@ -752,13 +760,27 @@ impl Bot {
 
     /// Is practice switch `bit` on for this match's salt group? Only in confirmed practice (mode 1).
     /// With `MB_VARLOG` set, the first read that is on is logged to stderr (self-test).
-    fn vsw(&mut self, bit: u8) -> bool {
+    fn vsw(&self, bit: u16) -> bool {
         let on = self.mode == 1 && self.variant & bit != 0;
-        if on && variant_log_on() && self.variant_seen & bit == 0 {
-            self.variant_seen |= bit;
+        if on && variant_log_on() && self.variant_seen.get() & bit == 0 {
+            self.variant_seen.set(self.variant_seen.get() | bit);
             eprintln!("VARIANT bit {} read as on (group {}, mask {})", bit, self.salt_group, self.variant);
         }
         on
+    }
+
+    /// How long a match that looks like practice stays guarded (see `p_lite_until`); 0 with V_PLITE0.
+    pub(crate) fn p_lite_t(&self) -> f32 {
+        if self.vsw(V_PLITE0) {
+            0.0
+        } else {
+            p_lite_until()
+        }
+    }
+
+    /// Practice break-and-heal on for this match (V_HEAL, V_HEAL_ANY, or the simulator knob 23).
+    fn heal_on(&self) -> bool {
+        self.vsw(V_HEAL_ANY) || self.vsw(V_HEAL) || (self.mode == 1 && practice::knob(23) > 0.5)
     }
 
     fn rand(&mut self) -> f32 {
@@ -1493,7 +1515,7 @@ impl Bot {
         // first death comes at a median of 11 s and after 16 s in one match in eight. Until then,
         // or until our own first kill, defend ourselves but do not rush weapons, boost around or
         // pick fights with mechs that are leaving us alone.
-        let p_lite = self.mode == 1 && self.kills == 0 && t < p_lite_until();
+        let p_lite = self.mode == 1 && self.kills == 0 && t < self.p_lite_t();
         let slot_of = |k: &str| -> Option<usize> { (0..2).find(|&i| me.wpn[i].as_ref().map_or(false, |w| w.kind == k)) };
         let gun_s = slot_of("gun");
         let laser_s = slot_of("laser");
@@ -1695,9 +1717,10 @@ impl Bot {
             // Practice break-and-heal (switch V_HEAL, or PR_TUNE knob 23): badly hurt
             // with enough hunters about (knob 26 tracked, 0 = any), break line of sight and
             // regenerate instead of trading to the death. Kills gate knob 24 is 0 (always open).
-            let heal = (self.vsw(V_HEAL) || (self.mode == 1 && practice::knob(23) > 0.5)) && self.kills as f32 >= practice::knob(24);
+            let heal = self.heal_on() && self.kills as f32 >= practice::knob(24);
+            let need_tracked = if self.vsw(V_HEAL_ANY) { 0.0 } else { practice::knob(26) };
             let tracked = self.enemies.values().filter(|e| t - e.seen < 8.0).count() as f32;
-            if heal && !self.retreating && !finishable && hp_frac < practice::knob(25) && tracked >= practice::knob(26) {
+            if heal && !self.retreating && !finishable && hp_frac < practice::knob(25) && tracked >= need_tracked {
                 self.retreating = true;
                 self.cover = None;
             } else if heal && self.retreating && !(hp_frac >= 0.9 || (threats.is_empty() && hp_frac >= 0.7 && t - self.last_hurt_t > 6.0)) {
@@ -2074,7 +2097,13 @@ impl Bot {
             // Practice (mode 1): stand off further, by weapon. Switch V_RANGE100 sets 100 m for
             // gun and laser alike; PR_TUNE knobs 15 and 16 do the same in the simulator.
             if self.mode == 1 {
-                let pr = if self.vsw(V_RANGE100) { 100.0 } else { practice::knob(if laser_s.is_some() { 16 } else { 15 }) };
+                let pr = if self.vsw(V_RANGE100) {
+                    100.0
+                } else if self.vsw(V_RANGE40) {
+                    40.0
+                } else if self.vsw(V_RANGE150) {
+                    150.0
+                } else { practice::knob(if laser_s.is_some() { 16 } else { 15 }) };
                 if pr > 0.0 {
                     range = pr;
                 }
@@ -2648,7 +2677,7 @@ impl Bot {
         }
         // Practice break-and-heal (knob 23): dealing damage also resets the regeneration clock, so
         // hold fire while healing. Only this rule sets `retreating` in practice.
-        if self.retreating && (self.vsw(V_HEAL) || (self.mode == 1 && practice::knob(23) > 0.5)) {
+        if self.retreating && self.heal_on() {
             fire = [false, false];
         }
         // Reload in quiet moments.
@@ -2694,7 +2723,7 @@ impl Bot {
             let mut bs = i32::MIN;
             for (i, c) in ch.iter().enumerate() {
                 let id = c["id"].as_str().unwrap_or("");
-                let s = if self.mode == 1 { practice::upgrade_score(id) } else { None }.unwrap_or_else(|| Self::upgrade_score(id));
+                let s = if self.mode == 1 { if self.vsw(V_SHAREDUP) { None } else { practice::upgrade_score(id) } } else { None }.unwrap_or_else(|| Self::upgrade_score(id));
                 if s > bs {
                     bs = s;
                     bi = i;
