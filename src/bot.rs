@@ -563,6 +563,32 @@ const V_EAGER: u16 = 16384;
 /// before the opening-safety commit. Never acts in confirmed free-for-all.
 const V_OPEN_OFF: u16 = 32768;
 
+/// Late-game practice switches, all off (practice mode only). `MB_PG=134` turns on 1, 3 and 4 in
+/// the simulator.
+/// 1 `PG_DROP_REPAIR`: HP below 80% and a supply drop landed or landing within 200 m inside the
+///   zone: go and hold its ring for the capture before anything else, shooting as usual.
+/// 2 `PG_REST_AFTER5`: from the fifth kill, nothing in view for 3 s and HP below 85%: cover, all
+///   fire held, until HP is above 95% or a mech shows up.
+/// 3 `PG_CUBE_STOP`: with ten cubes, no more walks to cubes, no crates, no drone farming.
+/// 4 `PG_HOLD_FOR_HUNTER`: holding a laser, a hunter coming at us from beyond 150 m: wait near
+///   cover and let it come, charging as it enters range.
+const PG_DROP_REPAIR: bool = false;
+const PG_REST_AFTER5: bool = false;
+const PG_CUBE_STOP: bool = false;
+const PG_HOLD_FOR_HUNTER: bool = false;
+/// Kills needed before PG_REST_AFTER5 acts (5; `MB_PGK` overrides it in the simulator).
+fn pg_kills() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("MB_PGK").ok().and_then(|v| v.parse().ok()).unwrap_or(5.0))
+}
+fn pg(i: usize) -> bool {
+    static K: std::sync::OnceLock<[bool; 4]> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let e = std::env::var("MB_PG").unwrap_or_default();
+        [PG_DROP_REPAIR || e.contains('1'), PG_REST_AFTER5 || e.contains('2'), PG_CUBE_STOP || e.contains('3'), PG_HOLD_FOR_HUNTER || e.contains('4')]
+    })[i]
+}
+
 fn variant_env() -> Option<u16> {
     static K: std::sync::OnceLock<Option<u16>> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("MB_VARIANT").ok().and_then(|v| v.parse().ok()))
@@ -609,6 +635,10 @@ pub struct Bot {
     variant: u16,
     variant_seen: std::cell::Cell<u16>,
     regroup: bool,
+    /// PG_HOLD_FOR_HUNTER: the waiting spot, when it was chosen, and for which hunter.
+    hfh_cover: Option<(f32, f32)>,
+    hfh_t: f32,
+    hfh_id: i64,
     watched_t: f32,
     run0_id: i64,
     run0_t0: f32,
@@ -785,6 +815,9 @@ impl Bot {
             variant: 0,
             variant_seen: std::cell::Cell::new(0),
             regroup: false,
+            hfh_cover: None,
+            hfh_t: -100.0,
+            hfh_id: -1,
             watched_t: -100.0,
             run0_id: -1,
             run0_t0: -100.0,
@@ -1971,14 +2004,18 @@ impl Bot {
             }
             // Regroup in the lulls (V_REGROUP): never leaves a fight (it starts only with nothing in
             // view) and ends the moment a mech shows up or hits us.
-            if self.vsw(V_REGROUP) {
+            // PG_REST_AFTER5 uses the same rule from the fifth kill, starting below 85% and
+            // resting to above 95%.
+            let rest5 = pg(1) && self.mode == 1 && self.kills as f32 >= pg_kills();
+            if self.vsw(V_REGROUP) || rest5 {
+                let (lo, hi) = if self.vsw(V_REGROUP) { (0.6, 0.9) } else { (0.85, 0.95) };
                 if self.enemies.values().any(|e| t - e.seen < 5.0 && self.w.los(e.eye(), my_center)) {
                     self.watched_t = t;
                 }
-                if !self.regroup && hp_frac < 0.6 && threats.is_empty() && t - self.last_hurt_t > 2.0 && t - self.watched_t > 3.0 && !finishable {
+                if !self.regroup && hp_frac < lo && threats.is_empty() && t - self.last_hurt_t > 2.0 && t - self.watched_t > 3.0 && !finishable {
                     self.regroup = true;
                     self.cover = None;
-                } else if self.regroup && (hp_frac >= 0.9 || !threats.is_empty() || t - self.last_hurt_t < 1.0) {
+                } else if self.regroup && (hp_frac >= hi || !threats.is_empty() || t - self.last_hurt_t < 1.0) {
                     self.regroup = false;
                 }
                 if self.regroup {
@@ -2058,8 +2095,10 @@ impl Bot {
         }
 
         // Nearest cube we can walk to: worth grabbing even mid-fight (HP, damage, upgrades).
+        // PG_CUBE_STOP: with ten cubes nothing is worth a detour (a cube on our path is still taken).
+        let cube_stop = pg(2) && self.mode == 1 && me.cubes >= 10.0;
         let mut near_cube: Option<(f32, (f32, f32), i64)> = None;
-        for (id, it) in &self.cubes {
+        for (id, it) in self.cubes.iter().filter(|_| !cube_stop) {
             if self.blacklist.get(id).map_or(false, |u| t < *u) {
                 continue;
             }
@@ -2194,7 +2233,7 @@ impl Bot {
         let drone_flee = drone_hot && (drones_near >= 2 || ((self.mode == 2 || pf(3)) && hp_frac <= 0.2));
         let eager = self.vsw(V_EAGER) && hp_frac > 0.4;
         let cover_open_on = self.vsw(V_COVERSPOT) && self.kills == 0;
-        let farm_drone = self.tune[15] < 0.5 && drones_near <= 1 && target.is_none() && ((hp_frac > 0.75 && t >= 25.0) || eager) && quiet;
+        let farm_drone = self.tune[15] < 0.5 && drones_near <= 1 && !cube_stop && target.is_none() && ((hp_frac > 0.75 && t >= 25.0) || eager) && quiet;
         if !drone_flee && ((drone_hot && drones_near == 1 && hp_frac > 0.2) || farm_drone) {
             let mut bd = 85.0;
             for n in &npcs {
@@ -2323,6 +2362,28 @@ impl Bot {
                 }
             }
         }
+        // PG_DROP_REPAIR: hurt, with a supply drop in reach: go and hold its ring for the capture.
+        let pg_drop = if pg(0) && self.mode == 1 && !zone_urgent { self.pg_drop_goal(&me, t, obs, &in_bounds) } else { None };
+        // PG_HOLD_FOR_HUNTER: with a laser and a hunter coming at us from beyond 150 m, wait near
+        // cover and let it come.
+        let mut pg_hold: Option<Mv> = None;
+        if pg(3) && self.mode == 1 && laser_s.is_some() && !self.retreating {
+            if let Some(e) = &target {
+                let d = dxy(&e.pos, &me.pos);
+                let to = norm2([me.pos[0] - e.pos[0], me.pos[1] - e.pos[1]]);
+                if e.hostile_until > t && d > 150.0 && e.vel[0] * to[0] + e.vel[1] * to[1] > 1.0 {
+                    if self.hfh_id != e.id || t - self.hfh_t > 1.0 {
+                        self.hfh_cover = self.find_cover(&me, std::slice::from_ref(e), &z, false, 24.0, 3.0);
+                        self.hfh_id = e.id;
+                        self.hfh_t = t;
+                    }
+                    pg_hold = Some(match self.hfh_cover {
+                        Some(c) if (c.0 - here.0).hypot(c.1 - here.1) > 1.5 => Mv::Goto(c, false),
+                        _ => Mv::Hold,
+                    });
+                }
+            }
+        }
         let cover_mv = self.cover_move(&me, t, &threats, &z, my_center, laser_s.is_some(), light_s.is_some(), &in_bounds);
         // Hold range in a fight we started (confirmed free-for-all). In our recorded showdown
         // matches we opened from a median 132 m while closing at 5.8 m/s, and a quarter of those
@@ -2350,6 +2411,22 @@ impl Bot {
             }
         } else if let Some(cm) = cover_mv {
             mv = cm;
+        } else if let Some(g) = pg_drop {
+            // Run for the drop, then keep moving inside its 8 m ring for the 4 s capture; shooting
+            // goes on as usual.
+            let (dx, dy) = (g.0 - here.0, g.1 - here.1);
+            let dd = dx.hypot(dy);
+            if dd > 4.5 {
+                mv = Mv::Goto(g, me.energy > 30.0 && dd > 15.0);
+            } else {
+                let r = norm2([here.0 - g.0, here.1 - g.1]);
+                let side = if (t * 1.2).sin() > 0.0 { 1.0 } else { -1.0 };
+                let tang = [-r[1] * side, r[0] * side];
+                let pull = (dd / 4.5).min(1.0);
+                mv = Mv::Direct(norm2([tang[0] - r[0] * pull, tang[1] - r[1] * pull]), false);
+            }
+        } else if let Some(h) = pg_hold {
+            mv = h;
         } else if let Some(pm) = peek_mv {
             mv = pm;
         } else if let (Some(r), false) = (run0, cornered) {
@@ -2517,7 +2594,7 @@ impl Bot {
                     }
                 }
             }
-            for (id, it) in &self.cubes {
+            for (id, it) in self.cubes.iter().filter(|_| !cube_stop) {
                 if in_bounds(&it.pos) && (it.pos[2] - me.pos[2]).abs() < 6.0 && !danger(&it.pos) {
                     consider(dxy(&it.pos, &me.pos) * 0.5, &it.pos, *id, &mut goal);
                 }
@@ -2539,7 +2616,7 @@ impl Bot {
                     consider(dxy(&it.pos, &me.pos) * pref, &it.pos, *id, &mut goal);
                 }
             }
-            if (hp_frac > 0.85 || eager) && calm && (!cautious || t >= self.tune[18]) {
+            if (hp_frac > 0.85 || eager) && calm && !cube_stop && (!cautious || t >= self.tune[18]) {
                 for (id, it) in &self.crates {
                     if in_bounds(&it.pos) && !danger(&it.pos) && (!cautious || it.pos[2] - me.pos[2] <= 3.0) {
                         consider(dxy(&it.pos, &me.pos) * 1.0 + 10.0, &it.pos, *id, &mut goal);
@@ -3036,7 +3113,7 @@ impl Bot {
         }
         // Practice break-and-heal (knob 23): dealing damage also resets the regeneration clock, so
         // hold fire while healing. Only this rule sets `retreating` in practice.
-        if self.retreating && (self.heal_on() || (self.regroup && self.vsw(V_REGROUP))) {
+        if self.retreating && (self.heal_on() || (self.regroup && (self.vsw(V_REGROUP) || pg(1)))) {
             fire = [false, false];
         }
         // Reload in quiet moments.

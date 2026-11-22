@@ -73,6 +73,32 @@ impl Bot {
         best
     }
 
+    /// PG_DROP_REPAIR: a supply drop worth breaking off for, as its position: HP below 80%, within
+    /// 200 m and inside the zone, landing about when we can get there (or landed), and not one
+    /// somebody else is already capturing.
+    pub(super) fn pg_drop_goal(&self, me: &Me, t: f32, obs: &serde_json::Value, in_bounds: &dyn Fn(&[f32]) -> bool) -> Option<(f32, f32)> {
+        if me.hp / me.max_hp.max(1.0) >= 0.80 {
+            return None;
+        }
+        let my_id = obs["self"]["id"].as_i64().unwrap_or(-1);
+        let _ = t;
+        let mut best: Option<(f32, (f32, f32))> = None;
+        for d in obs["drops"].as_array()? {
+            let p = [d["pos"][0].as_f64()? as f32, d["pos"][1].as_f64()? as f32, d["pos"][2].as_f64().unwrap_or(0.0) as f32];
+            let dist = dxy(&p, &me.pos);
+            let lands_in = d["lands_in"].as_f64().unwrap_or(99.0) as f32;
+            let holder = d["holder"].as_i64();
+            let theirs = holder.map_or(false, |h| h != my_id) && d["progress"].as_f64().unwrap_or(0.0) > 0.0;
+            if theirs || dist > 200.0 || !in_bounds(&p) || lands_in > dist / me.walk.max(1.0) + 3.0 {
+                continue;
+            }
+            if best.map_or(true, |b| dist < b.0) {
+                best = Some((dist, (p[0], p[1])));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
     /// Practice only: drop lightning for a laser when no enemy is close enough to punish the
     /// 1.65 s the new laser needs before it can fire.
     pub(super) fn practice_swap_ok(&self, me: &Me, threats: &[Enemy]) -> bool {
