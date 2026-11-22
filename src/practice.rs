@@ -16,8 +16,8 @@ use std::sync::OnceLock;
 /// 16: practice fight range (m) while we hold a laser (0 = the shared range). House experts hit
 ///     78% with the gun inside 60 m and 41% at 60 to 120 m; their lasers hit 62%, 31%, and 0%
 ///     beyond 120 m (private/HOUSE.md). Our laser is hitscan, so it loses nothing by standing off.
-pub(super) const RANGE_GUN: f32 = 0.0;
-pub(super) const RANGE_LASER: f32 = 0.0;
+pub(super) const RANGE_GUN: f32 = 100.0;
+pub(super) const RANGE_LASER: f32 = 100.0;
 pub(super) fn knob(i: usize) -> f32 {
     static K: OnceLock<[f32; 17]> = OnceLock::new();
     K.get_or_init(|| {
