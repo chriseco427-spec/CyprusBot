@@ -376,6 +376,19 @@ fn open_run_on(w: &World, a: (f32, f32), b: (f32, f32)) -> f32 {
     best
 }
 
+/// Free-for-all rules from the recorded showdowns (each only in a confirmed free-for-all, mode 2;
+/// set a constant to false to switch it off):
+/// - supply drops: go when at most 2 tracked mechs are within 100 m of the drop and our HP is at
+///   least 50% (instead of nobody within 100 m). Ring entries died within 15 s 8% of the time
+///   against a 9-13% baseline; loitering 8-40 m away 25%.
+/// - first-shot guard: no first shot at a mech holding a laser unless we hold a laser too (gun or
+///   lightning against a laser: kills 23% against 22%, 22% against 17%).
+/// - laser duel floor: when both of us hold a laser, no first shot from under 70 m (won 61% under
+///   70 m, 71% at 70-100 m, 75% over 100 m).
+const FFA_DROP_RULE: bool = true;
+const FFA_LASER_GUARD: bool = true;
+const FFA_LASER_FLOOR: bool = true;
+
 /// First-shot knobs (`MB_FS=a,b,...`): 0 earliest time (s), 1 our HP share, 2 longest range (m),
 /// 3 longest range without a ready laser (m), 4 their power as a multiple of ours, 5 how far off
 /// us the target must be looking (rad).
@@ -1481,6 +1494,8 @@ impl Bot {
                     && away
                     && (lonely || busy)
                     && nobody_on_us
+                    && !(FFA_LASER_GUARD && e.has("laser") && laser_s.is_none())
+                    && !(FFA_LASER_FLOOR && e.has("laser") && laser_s.is_some() && d < 70.0)
                     && power(e) < fs[4] * my_power;
                 if ambush {
                     self.commit_id = e.id;
@@ -2040,12 +2055,17 @@ impl Bot {
                     // Free-for-all (confirmed): commit or stay away. In recorded matches the mech
                     // that took a drop usually went on to win, drops were rarely contested, and
                     // loitering near one without entering was the dangerous choice. So go only
-                    // when nobody tracked is within 100 m of it, and time the walk to arrive as
+                    // when at most 2 tracked mechs are within 100 m of it (FFA_DROP_RULE; formerly
+                    // none) and we are at 50% HP or more, and time the walk to arrive as
                     // it lands rather than wait in the open.
                     let ffa_drop = self.mode == 2
                         && calm
                         && dist < 200.0
-                        && !en.values().any(|e| t - e.seen < 15.0 && dxy(&e.pos, &p) < 100.0)
+                        && (if FFA_DROP_RULE {
+                            hp_frac >= 0.5 && en.values().filter(|e| t - e.seen < 15.0 && dxy(&e.pos, &p) < 100.0).count() <= 2
+                        } else {
+                            !en.values().any(|e| t - e.seen < 15.0 && dxy(&e.pos, &p) < 100.0)
+                        })
                         && f(&d["lands_in"]) < dist / me.walk + 3.0;
                     let other_drop = self.mode != 2 && f(&d["lands_in"]) < dist / me.walk + 10.0 && (!cautious || (calm && dist < 120.0 && !danger(&p)));
                     if in_bounds(&p) && dist < 300.0 && (ffa_drop || other_drop) {
