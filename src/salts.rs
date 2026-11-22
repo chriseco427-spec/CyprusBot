@@ -23,4 +23,4 @@
 //! Bits add up (5 = laser hunt and heal). Change one entry per submission.
 
 pub const SALTS: [u64; 8] = [3, 1002, 4, 4, 3, 4, 4, 3];
-pub const VARIANT: [u16; 8] = [0; 8];
+pub const VARIANT: [u16; 8] = [0, 16, 0, 0, 0, 0, 0, 0];
